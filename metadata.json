@@ -1,0 +1,6 @@
+{
+  "name": "Model Checking Explorable",
+  "description": "An interactive explorable explanation of model checking and formal verification, based on Nicky Case's design principles.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

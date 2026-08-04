@@ -5,124 +5,137 @@
 
 import express from 'express';
 import path from 'path';
-import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI } from '@google/genai';
 import dotenv from 'dotenv';
 
 dotenv.config();
 
 const app = express();
-const PORT = 3000;
 
-app.use(express.json());
+// Cloud Run injects PORT and expects the container to listen on it. Hardcoding
+// a port makes the revision fail its startup health check.
+const PORT = Number(process.env.PORT) || 8080;
+const MODEL = process.env.GEMINI_MODEL || 'gemini-3.6-flash';
+const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 
-// Lazy-initialized GoogleGenAI client to avoid crashes if API Key is missing on boot
+app.use(express.json({ limit: '16kb' }));
+
 let aiClient: GoogleGenAI | null = null;
 
 function getGeminiClient(): GoogleGenAI | null {
   if (!aiClient) {
     const apiKey = process.env.GEMINI_API_KEY;
-    if (apiKey && apiKey !== "MY_GEMINI_API_KEY" && apiKey.trim() !== "") {
-      aiClient = new GoogleGenAI({
-        apiKey: apiKey,
-        httpOptions: {
-          headers: {
-            'User-Agent': 'aistudio-build'
-          }
-        }
-      });
+    if (apiKey && apiKey !== 'MY_GEMINI_API_KEY' && apiKey.trim() !== '') {
+      aiClient = new GoogleGenAI({ apiKey });
     }
   }
   return aiClient;
 }
 
-// 1. API Route: Playful AI Tutor translation/explainer for formulas
-app.post('/api/explain-formula', async (req, res) => {
-  const { formula, metaphor } = req.body;
+/**
+ * The offline copy must never claim a verification result. The model checker
+ * runs entirely in the browser; this endpoint only explains notation.
+ */
+function offlineExplanation(formula: string, plainEnglish: string): string {
+  return `**\`${formula}\`**
 
-  if (!formula) {
-    res.status(400).json({ error: "Missing temporal logic formula." });
+${plainEnglish || 'A temporal-logic property over the states of your machine.'}
+
+The operators:
+- **G** — *globally*. True at every moment of a run.
+- **F** — *finally*. True now or at some later moment.
+- **X** — *next*. True at the very next step.
+- **U** — *until*. The left side holds at every step up to the moment the right side becomes true.
+- **A** / **E** — *on all paths* / *on some path*. CTL puts one of these in front of each temporal operator.
+
+The AI explainer is not configured on this server, so this is the built-in reference. It says nothing about whether your model passes — press **Run the verifier** for that.`;
+}
+
+app.get('/healthz', (_req, res) => {
+  res.status(200).json({ status: 'ok' });
+});
+
+app.post('/api/explain-formula', async (req, res) => {
+  const { formula, plainEnglish, metaphor } = req.body ?? {};
+
+  if (typeof formula !== 'string' || formula.trim() === '' || formula.length > 200) {
+    res.status(400).json({ error: 'Send a `formula` string of at most 200 characters.' });
     return;
   }
 
-  const systemInstructions = `You are Nicky Case (ncase.me), a builder of playful 'explorable explanations' and educational mechanics.
-Your goal is to explain formal verification and temporal logic in a super simple, conversational, visually evocative, and jargon-free way.
-Use analogies, bullet points, and high contrast typography metaphors. Do not use complex math jargon. Keep the tone warm, clear, and adventurous.
-Limit your response to 2 key paragraphs or a simple bulleted list. Maintain a markdown format that is easy to render.`;
+  const safePlain = typeof plainEnglish === 'string' ? plainEnglish.slice(0, 300) : '';
+  const safeMetaphor = typeof metaphor === 'string' ? metaphor.slice(0, 200) : 'a small state machine';
 
-  const prompt = `Explain the following temporal logic formula in terms of our real-life system metaphor.
-System Metaphor: ${metaphor || "A high-tech mechanical model"}
-Temporal Formula: ${formula}
+  const client = getGeminiClient();
+  if (!client) {
+    res.json({ explanation: offlineExplanation(formula, safePlain), isFallback: true });
+    return;
+  }
 
-Please breaks down what:
-1. The operators (like G, F, X, U, A, E, if present) mean in simple terms.
-2. What the formula guarantees if we verify it successfully.
-Keep it extremely friendly, like a comic-strip description!`;
+  const systemInstruction = `You write short explanations for an interactive "explorable explanation" about formal verification, in the tradition of playful, hand-built educational toys.
+
+Style: warm, concrete, conversational, second person. Use analogies to everyday machines. No unexplained jargon; if you use a technical term, define it in the same sentence.
+
+Accuracy matters more than charm. Never claim a specific model has been verified or that any particular bug does or does not exist — you cannot see the user's state machine. Explain only what the notation means and what a successful proof would guarantee.
+
+Format: at most two short paragraphs, or one short bulleted list. Plain Markdown, using ** for bold and backticks for formulas.`;
+
+  const prompt = `Explain this temporal-logic property to a learner.
+
+System being modelled: ${safeMetaphor}
+Formula: ${formula}
+Intended reading: ${safePlain}
+
+Cover: (1) what each operator in the formula means, and (2) what a successful proof of it would guarantee about the system.`;
 
   try {
-    const client = getGeminiClient();
-    
-    if (!client) {
-      // Friendly, highly polished offline fallback if API key is not present/configured
-      const offlineResponse = `### 💡 Exploring: \`${formula}\` (Simulated Explanation)
+    const response = await client.models.generateContent({
+      model: MODEL,
+      contents: prompt,
+      config: { systemInstruction }
+    });
 
-This temporal logic specification represents a fundamental rule about the behavior of your system!
-
-*   **⚡ Always (G)**: The letter **G** stands for **Globally**. It acts as an absolute seal of safety across all parallel universes (paths of execution).
-*   **🔮 Eventually (F)**: The letter **F** stands for **Future**. It promises that a desired state is guaranteed to resolve.
-*   **🎯 The Target**: \`${metaphor}\`
-
-Because the verification engine works offline, this fallback explains *Safety & Progress* structures instantly. Plug in a real Gemini API Key to enable custom prompt responses!`;
-      
-      res.json({ explanation: offlineResponse, isFallback: true });
+    const text = response.text;
+    if (!text) {
+      res.json({ explanation: offlineExplanation(formula, safePlain), isFallback: true });
       return;
     }
-
-    const response = await client.models.generateContent({
-      model: "gemini-3.5-flash",
-      contents: prompt,
-      config: {
-        systemInstruction: systemInstructions,
-        temperature: 0.7,
-      }
-    });
-
-    res.json({ explanation: response.text || "Failed to generate explanation. Let's trace nodes together!", isFallback: false });
-  } catch (error: any) {
-    console.error("Gemini API Error:", error);
-    res.json({
-      explanation: `### 🔮 Verification Insights (Local Parser Mode)
-We successfully compiled **\`${formula}\`** into our model checked graph solver tree.
-*   **A Temporal Rule** represents an invariant that must be proved for *all* reachable schedules of transitions.
-*   Your layout was fully parsed under the rules of **${metaphor}**. No deadlock cycles were identified.
-
-*Error logs: ${error?.message || "Transient Network Offline"}*`,
-      isFallback: true
-    });
+    res.json({ explanation: text, isFallback: false });
+  } catch (error) {
+    console.error('Gemini API error:', error);
+    res.json({ explanation: offlineExplanation(formula, safePlain), isFallback: true });
   }
 });
 
-// 2. Vite and Static Asset Middleware setup
+// Unknown API routes must 404 rather than fall through to the SPA shell.
+app.use('/api', (_req, res) => {
+  res.status(404).json({ error: 'Unknown API route.' });
+});
+
 async function setupServer() {
-  if (process.env.NODE_ENV !== 'production') {
-    console.log("Starting in developer mode with Vite HMR middleware...");
+  if (!IS_PRODUCTION) {
+    console.log('Development mode: attaching Vite middleware.');
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa'
     });
     app.use(vite.middlewares);
   } else {
-    console.log("Serving compiled static build in production...");
+    console.log('Production mode: serving the compiled build.');
     const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
-    app.get('*', (req, res) => {
+    app.get('*', (_req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server running at http://localhost:${PORT}`);
+    console.log(`Listening on http://0.0.0.0:${PORT}`);
   });
 }
 
-setupServer();
+setupServer().catch(err => {
+  console.error('Failed to start server:', err);
+  process.exit(1);
+});

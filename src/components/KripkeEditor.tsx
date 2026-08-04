@@ -3,10 +3,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useRef, useEffect } from 'react';
-import { KripkeState, KripkeTransition } from '../types';
-import { Plus, Trash, Play, HelpCircle, ToggleLeft, ToggleRight, ArrowRight, CircleDot } from 'lucide-react';
-import { motion, AnimatePresence } from 'motion/react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
+import { KripkeState, KripkeTransition, PropKey } from '../types';
+import { Plus, Trash, HelpCircle, ToggleLeft, ToggleRight, ArrowRight, CircleDot } from 'lucide-react';
 
 interface KripkeEditorProps {
   states: KripkeState[];
@@ -15,11 +14,22 @@ interface KripkeEditorProps {
   onTransitionsChange: (transitions: KripkeTransition[]) => void;
   activeStateId: string | null;
   onActiveStateChange: (stateId: string | null) => void;
-  highlightedPath: string[]; // Traced nodes from the Model Checker
+  highlightedPath: string[];
   violationStateId: string | null;
   allowEditing: boolean;
   chapterId: number;
+  unreachableStateIds: string[];
 }
+
+/**
+ * The canvas uses a fixed coordinate system and a viewBox, so the graph scales
+ * to any screen instead of being clipped on narrow ones. Pointer positions are
+ * converted through the SVG's own screen matrix, which stays correct under any
+ * scaling or letterboxing.
+ */
+const VIEW_W = 820;
+const VIEW_H = 460;
+const NODE_R = 38;
 
 export default function KripkeEditor({
   states,
@@ -31,107 +41,94 @@ export default function KripkeEditor({
   highlightedPath,
   violationStateId,
   allowEditing,
-  chapterId
+  chapterId,
+  unreachableStateIds
 }: KripkeEditorProps) {
-  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(states[0]?.id || null);
-  const [draggedNodeId, setDraggedNodeId] = useState<string | null>(null);
-  const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 });
-  
-  // Transition builder state
+  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(states[0]?.id ?? null);
   const [newTransFrom, setNewTransFrom] = useState<string>('');
   const [newTransTo, setNewTransTo] = useState<string>('');
   const [newTransAction, setNewTransAction] = useState<string>('');
+  const [transitionError, setTransitionError] = useState<string>('');
 
   const svgRef = useRef<SVGSVGElement>(null);
+  const dragRef = useRef<{ id: string; dx: number; dy: number } | null>(null);
+  const movedRef = useRef(false);
+  // Keep the latest states in a ref so the window drag listeners never go stale.
+  const statesRef = useRef(states);
+  statesRef.current = states;
+  const onStatesChangeRef = useRef(onStatesChange);
+  onStatesChangeRef.current = onStatesChange;
 
-  // Auto-select first state if none selected
+  const unreachable = new Set(unreachableStateIds);
+
+  // If the selected node disappears (deleted, or the chapter changed), reselect.
   useEffect(() => {
-    if (states.length > 0 && !selectedNodeId) {
-      setSelectedNodeId(states[0].id);
+    if (states.length === 0) {
+      if (selectedNodeId !== null) setSelectedNodeId(null);
+      return;
+    }
+    if (!selectedNodeId || !states.some(s => s.id === selectedNodeId)) {
+      setSelectedNodeId(states.find(s => s.isInitial)?.id ?? states[0].id);
     }
   }, [states, selectedNodeId]);
 
-  // Handle Drag Start
-  const handleMouseDown = (e: React.MouseEvent, stateId: string) => {
-    if (!allowEditing) return;
-    e.preventDefault();
-    const state = states.find(s => s.id === stateId);
-    if (!state || !svgRef.current) return;
-
-    const rect = svgRef.current.getBoundingClientRect();
-    const mouseX = e.clientX - rect.left;
-    const mouseY = e.clientY - rect.top;
-
-    setDraggedNodeId(stateId);
-    setDragOffset({
-      x: mouseX - state.x,
-      y: mouseY - state.y
-    });
-    setSelectedNodeId(stateId);
-  };
-
-  // Handle Drag Touch Start for mobile
-  const handleTouchStart = (e: React.TouchEvent, stateId: string) => {
-    if (!allowEditing) return;
-    const state = states.find(s => s.id === stateId);
-    if (!state || !svgRef.current || e.touches.length === 0) return;
-
-    const rect = svgRef.current.getBoundingClientRect();
-    const touch = e.touches[0];
-    const mouseX = touch.clientX - rect.left;
-    const mouseY = touch.clientY - rect.top;
-
-    setDraggedNodeId(stateId);
-    setDragOffset({
-      x: mouseX - state.x,
-      y: mouseY - state.y
-    });
-    setSelectedNodeId(stateId);
-  };
-
-  // Handle Dragging
-  const handleMouseMove = (e: React.MouseEvent) => {
-    if (!draggedNodeId || !svgRef.current) return;
-    const rect = svgRef.current.getBoundingClientRect();
-    const mouseX = e.clientX - rect.left;
-    const mouseY = e.clientY - rect.top;
-
-    // Boundary constraints: ensure node stays inside the workspace
-    const newX = Math.max(50, Math.min(rect.width - 50, mouseX - dragOffset.x));
-    const newY = Math.max(50, Math.min(rect.height - 50, mouseY - dragOffset.y));
-
-    onStatesChange(
-      states.map(s => s.id === draggedNodeId ? { ...s, x: newX, y: newY } : s)
-    );
-  };
-
-  const handleTouchMove = (e: React.TouchEvent) => {
-    if (!draggedNodeId || !svgRef.current || e.touches.length === 0) return;
-    const rect = svgRef.current.getBoundingClientRect();
-    const touch = e.touches[0];
-    const mouseX = touch.clientX - rect.left;
-    const mouseY = touch.clientY - rect.top;
-
-    const newX = Math.max(50, Math.min(rect.width - 50, mouseX - dragOffset.x));
-    const newY = Math.max(50, Math.min(rect.height - 50, mouseY - dragOffset.y));
-
-    onStatesChange(
-      states.map(s => s.id === draggedNodeId ? { ...s, x: newX, y: newY } : s)
-    );
-  };
-
-  // Handle Drag End
-  const handleMouseUp = () => {
-    setDraggedNodeId(null);
-  };
-
-  useEffect(() => {
-    const handleGlobalMouseUp = () => setDraggedNodeId(null);
-    window.addEventListener('mouseup', handleGlobalMouseUp);
-    return () => window.removeEventListener('mouseup', handleGlobalMouseUp);
+  const toCanvasPoint = useCallback((clientX: number, clientY: number) => {
+    const svg = svgRef.current;
+    if (!svg) return null;
+    const ctm = svg.getScreenCTM();
+    if (!ctm) return null;
+    const point = new DOMPoint(clientX, clientY).matrixTransform(ctm.inverse());
+    return { x: point.x, y: point.y };
   }, []);
 
-  // Creation Utilities
+  const beginDrag = (clientX: number, clientY: number, stateId: string) => {
+    if (!allowEditing) return;
+    const state = statesRef.current.find(s => s.id === stateId);
+    const point = toCanvasPoint(clientX, clientY);
+    if (!state || !point) return;
+    dragRef.current = { id: stateId, dx: point.x - state.x, dy: point.y - state.y };
+    movedRef.current = false;
+    setSelectedNodeId(stateId);
+  };
+
+  // Drag listeners live on the window so the node keeps following the pointer
+  // even when it briefly leaves the canvas.
+  useEffect(() => {
+    const move = (clientX: number, clientY: number) => {
+      const drag = dragRef.current;
+      if (!drag) return;
+      const point = toCanvasPoint(clientX, clientY);
+      if (!point) return;
+      movedRef.current = true;
+      const x = Math.max(NODE_R + 8, Math.min(VIEW_W - NODE_R - 8, point.x - drag.dx));
+      const y = Math.max(NODE_R + 8, Math.min(VIEW_H - NODE_R - 8, point.y - drag.dy));
+      onStatesChangeRef.current(statesRef.current.map(s => (s.id === drag.id ? { ...s, x, y } : s)));
+    };
+
+    const onMouseMove = (e: MouseEvent) => move(e.clientX, e.clientY);
+    const onTouchMove = (e: TouchEvent) => {
+      if (!dragRef.current || e.touches.length === 0) return;
+      e.preventDefault();
+      move(e.touches[0].clientX, e.touches[0].clientY);
+    };
+    const onRelease = () => {
+      dragRef.current = null;
+    };
+
+    window.addEventListener('mousemove', onMouseMove);
+    window.addEventListener('mouseup', onRelease);
+    window.addEventListener('touchmove', onTouchMove, { passive: false });
+    window.addEventListener('touchend', onRelease);
+    window.addEventListener('touchcancel', onRelease);
+    return () => {
+      window.removeEventListener('mousemove', onMouseMove);
+      window.removeEventListener('mouseup', onRelease);
+      window.removeEventListener('touchmove', onTouchMove);
+      window.removeEventListener('touchend', onRelease);
+      window.removeEventListener('touchcancel', onRelease);
+    };
+  }, [toCanvasPoint]);
+
   const addNewState = () => {
     if (!allowEditing) return;
     const newId = `state_${Date.now().toString(36)}`;
@@ -141,8 +138,8 @@ export default function KripkeEditor({
       innerOpen: false,
       outerOpen: false,
       pressurized: false,
-      x: Math.floor(Math.random() * 200) + 150,
-      y: Math.floor(Math.random() * 150) + 150
+      x: 120 + ((states.length * 137) % (VIEW_W - 240)),
+      y: 110 + ((states.length * 91) % (VIEW_H - 220))
     };
     onStatesChange([...states, newState]);
     setSelectedNodeId(newId);
@@ -150,330 +147,279 @@ export default function KripkeEditor({
 
   const deleteState = (stateId: string) => {
     if (!allowEditing) return;
-    // Remove transitions associated with this state
+    const remaining = states.filter(s => s.id !== stateId);
     onTransitionsChange(transitions.filter(t => t.from !== stateId && t.to !== stateId));
-    onStatesChange(states.filter(s => s.id !== stateId));
-    if (selectedNodeId === stateId) {
-      setSelectedNodeId(states.find(s => s.id !== stateId)?.id || null);
-    }
+    onStatesChange(remaining);
+    if (selectedNodeId === stateId) setSelectedNodeId(remaining[0]?.id ?? null);
     if (activeStateId === stateId) {
-      onActiveStateChange(states.find(s => s.id !== stateId && s.isInitial)?.id || null);
+      onActiveStateChange(remaining.find(s => s.isInitial)?.id ?? remaining[0]?.id ?? null);
     }
   };
 
   const addTransition = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newTransFrom || !newTransTo || !newTransAction) return;
-    const newT: KripkeTransition = {
-      id: `trans_${Date.now().toString(36)}`,
-      from: newTransFrom,
-      to: newTransTo,
-      action: newTransAction.trim()
-    };
-    onTransitionsChange([...transitions, newT]);
+    if (!allowEditing) return;
+    setTransitionError('');
+    if (!newTransFrom || !newTransTo || !newTransAction.trim()) return;
+
+    if (transitions.some(t => t.from === newTransFrom && t.to === newTransTo)) {
+      setTransitionError('That transition already exists. Delete it first, or pick a different target.');
+      return;
+    }
+
+    onTransitionsChange([
+      ...transitions,
+      {
+        id: `trans_${Date.now().toString(36)}`,
+        from: newTransFrom,
+        to: newTransTo,
+        action: newTransAction.trim()
+      }
+    ]);
     setNewTransAction('');
   };
 
-  const deleteTransition = (tId: string) => {
-    onTransitionsChange(transitions.filter(t => t.id !== tId));
-  };
-
-  // State parameter toggling
-  const toggleStateProp = (stateId: string, flag: 'innerOpen' | 'outerOpen' | 'pressurized') => {
-    onStatesChange(
-      states.map(s => s.id === stateId ? { ...s, [flag]: !s[flag] } : s)
-    );
+  const toggleStateProp = (stateId: string, flag: PropKey) => {
+    if (!allowEditing) return;
+    onStatesChange(states.map(s => (s.id === stateId ? { ...s, [flag]: !s[flag] } : s)));
   };
 
   const setAsInitial = (stateId: string) => {
-    onStatesChange(
-      states.map(s => ({
-        ...s,
-        isInitial: s.id === stateId
-      }))
-    );
+    if (!allowEditing) return;
+    onStatesChange(states.map(s => ({ ...s, isInitial: s.id === stateId })));
     onActiveStateChange(stateId);
   };
 
-  // Graph arrow geometry helpers
+  /* ---------------- geometry ---------------- */
+
   const getLineData = (t: KripkeTransition) => {
     const fromState = states.find(s => s.id === t.from);
     const toState = states.find(s => s.id === t.to);
-
     if (!fromState || !toState) return null;
 
-    const r = 40; // circle radius
-
-    // Angle of the vector from -> to
-    const dx = toState.x - fromState.x;
-    const dy = toState.y - fromState.y;
-    const dist = Math.sqrt(dx * dx + dy * dy);
-
-    if (dist === 0) return null;
-
-    // Self loop
     if (t.from === t.to) {
       const cx = fromState.x;
-      const cy = fromState.y - r;
-      const pathData = `M ${cx - 15} ${cy + 12} A 25 25 0 1 1 ${cx + 15} ${cy + 12}`;
+      const cy = fromState.y - NODE_R;
       return {
-        path: pathData,
+        path: `M ${cx - 16} ${cy + 10} A 26 26 0 1 1 ${cx + 16} ${cy + 10}`,
         labelX: cx,
-        labelY: cy - 25,
-        isSelf: true
+        labelY: cy - 34
       };
     }
 
-    // Double-link (is there a link in reverse?)
+    const dx = toState.x - fromState.x;
+    const dy = toState.y - fromState.y;
+    const dist = Math.hypot(dx, dy);
+    if (dist === 0) return null;
+
+    const ux = dx / dist;
+    const uy = dy / dist;
+    const startX = fromState.x + ux * NODE_R;
+    const startY = fromState.y + uy * NODE_R;
+    const endX = toState.x - ux * (NODE_R + 4);
+    const endY = toState.y - uy * (NODE_R + 4);
+
     const hasReverse = transitions.some(other => other.from === t.to && other.to === t.from);
-    
-    // We start and end at the border of the circles
-    const padFromX = (dx / dist) * r;
-    const padFromY = (dy / dist) * r;
-    const padToX = (dx / dist) * r;
-    const padToY = (dy / dist) * r;
-
-    const startX = fromState.x + padFromX;
-    const startY = fromState.y + padFromY;
-    const endX = toState.x - padToX;
-    const endY = toState.y - padToY;
-
     if (hasReverse) {
-      // Curve line slightly to avoid overlap
-      const controlX = (startX + endX) / 2 - (dy / dist) * 35;
-      const controlY = (startY + endY) / 2 + (dx / dist) * 35;
+      const controlX = (startX + endX) / 2 - uy * 38;
+      const controlY = (startY + endY) / 2 + ux * 38;
       return {
         path: `M ${startX} ${startY} Q ${controlX} ${controlY} ${endX} ${endY}`,
-        labelX: controlX,
-        labelY: controlY,
-        isSelf: false
+        labelX: (startX + endX) / 4 + controlX / 2,
+        labelY: (startY + endY) / 4 + controlY / 2
       };
     }
 
-    // Straight vector
     return {
       path: `M ${startX} ${startY} L ${endX} ${endY}`,
       labelX: (startX + endX) / 2,
-      labelY: (startY + endY) / 2 - 12,
-      isSelf: false
+      labelY: (startY + endY) / 2 - 13
     };
   };
 
-  const selectedNode = states.find(s => s.id === selectedNodeId);
+  const selectedNode = states.find(s => s.id === selectedNodeId) ?? null;
 
-  // Specific metaphor keys depending on Chapter
-  const getMetaphorLabel = (prop: 'innerOpen' | 'outerOpen' | 'pressurized') => {
+  const getPropLabel = (prop: PropKey) => {
     if (chapterId === 1) {
-      return prop === 'innerOpen' ? 'Inner Door Open' : prop === 'outerOpen' ? 'Outer Door Open' : 'Cabin Pressurized';
-    } else if (chapterId === 2) {
-      return prop === 'innerOpen' ? 'Magnetron Heating ON' : prop === 'outerOpen' ? 'Door Open' : 'Cycled Finished';
-    } else if (chapterId === 3) {
-      return prop === 'innerOpen' ? 'Dust Storm Hatch Open' : prop === 'outerOpen' ? 'Internal Core Open' : 'Shield Engaged';
+      return prop === 'innerOpen'
+        ? 'InnerOpen — inner door'
+        : prop === 'outerOpen'
+          ? 'OuterOpen — outer door'
+          : 'Pressurized — cabin';
     }
-    return prop === 'innerOpen' ? 'Prop A (Inner)' : prop === 'outerOpen' ? 'Prop B (Outer)' : 'Prop C (Pressurized)';
+    if (chapterId === 2) {
+      return prop === 'innerOpen'
+        ? 'Heating — magnetron on'
+        : prop === 'outerOpen'
+          ? 'DoorOpen — door ajar'
+          : 'CookComplete — cycle done';
+    }
+    if (chapterId === 3) {
+      return prop === 'innerOpen'
+        ? 'HatchOpen — hatch open'
+        : prop === 'outerOpen'
+          ? 'RequestPending — command waiting'
+          : 'ShieldEngaged — dust shield up';
+    }
+    return prop === 'innerOpen' ? 'A' : prop === 'outerOpen' ? 'B' : 'C';
   };
 
-  return (
-    <div id="kripke-layout-editor" className="grid grid-cols-1 lg:grid-cols-3 gap-6 bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-2xl">
-      {/* Node Graphic Canvas */}
-      <div className="lg:col-span-2 flex flex-col bg-slate-950/70 rounded-xl overflow-hidden relative border border-slate-800/60 shadow-inner h-[460px]">
-        {/* Help & Sandbox Status */}
-        <div className="absolute top-4 left-4 z-10 flex items-center gap-2 pointer-events-none">
-          <span className="px-2.5 py-1 text-xs uppercase font-mono font-bold tracking-wider rounded bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 shadow-sm backdrop-blur-md">
-            Interactive State Engine
-          </span>
-          {allowEditing && (
-            <span id="label-draft" className="text-[10px] uppercase font-mono font-semibold tracking-wide text-slate-400 bg-slate-800/60 px-1.5 py-0.5 rounded border border-slate-700/50 backdrop-blur-md">
-              Draft mode
-            </span>
-          )}
-        </div>
+  const PROPS: Array<{ key: PropKey; colour: string }> = [
+    { key: 'innerOpen', colour: 'text-rose-400' },
+    { key: 'outerOpen', colour: 'text-yellow-400' },
+    { key: 'pressurized', colour: 'text-emerald-400' }
+  ];
 
-        {/* Canvas Area */}
+  return (
+    <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-2xl">
+      {/* Canvas */}
+      <div className="lg:col-span-2 flex flex-col bg-slate-950/70 rounded-xl overflow-hidden relative border border-slate-800">
         <svg
           ref={svgRef}
-          className="w-full h-full select-none cursor-default"
-          onMouseMove={handleMouseMove}
-          onMouseUp={handleMouseUp}
-          onTouchMove={handleTouchMove}
-          onTouchEnd={handleMouseUp}
+          viewBox={`0 0 ${VIEW_W} ${VIEW_H}`}
+          className="w-full select-none"
+          style={{ touchAction: 'none', aspectRatio: `${VIEW_W} / ${VIEW_H}` }}
+          role="img"
+          aria-label="State machine diagram"
         >
-          {/* SVG Definitions for prettier curved arrow markers */}
           <defs>
-            <marker
-              id="arrowhead"
-              markerWidth="8"
-              markerHeight="6"
-              refX="6"
-              refY="3"
-              orient="auto"
-            >
-              <polygon points="0 0, 8 3, 0 6" fill="#38bdf8" />
+            <marker id="arrowhead" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+              <polygon points="0 0, 8 3, 0 6" fill="#475569" />
             </marker>
-            <marker
-              id="arrowhead-highlight"
-              markerWidth="8"
-              markerHeight="6"
-              refX="6"
-              refY="3"
-              orient="auto"
-            >
+            <marker id="arrowhead-trace" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
               <polygon points="0 0, 8 3, 0 6" fill="#f43f5e" />
             </marker>
           </defs>
 
-          {/* Graticule Grid background */}
-          <g className="opacity-20">
-            <line x1="0" y1="230" x2="100%" y2="230" stroke="#334155" strokeDasharray="5,5" />
-            <line x1="50%" y1="0" x2="50%" y2="100%" stroke="#334155" strokeDasharray="5,5" />
+          <g opacity="0.15">
+            <line x1="0" y1={VIEW_H / 2} x2={VIEW_W} y2={VIEW_H / 2} stroke="#334155" strokeDasharray="5,5" />
+            <line x1={VIEW_W / 2} y1="0" x2={VIEW_W / 2} y2={VIEW_H} stroke="#334155" strokeDasharray="5,5" />
           </g>
 
-          {/* Draw Transitions (Wires) */}
-          {transitions.map((t) => {
+          {/* Transitions */}
+          {transitions.map(t => {
             const line = getLineData(t);
             if (!line) return null;
 
-            const isTracePath = highlightedPath.includes(t.from) && highlightedPath.includes(t.to) &&
-              highlightedPath.indexOf(t.to) === highlightedPath.indexOf(t.from) + 1;
-            
-            const isSelfTrace = highlightedPath.includes(t.from) && t.from === t.to;
+            const fromIdx = highlightedPath.indexOf(t.from);
+            const isTraced =
+              t.from === t.to
+                ? highlightedPath.filter(id => id === t.from).length > 1
+                : fromIdx !== -1 && highlightedPath[fromIdx + 1] === t.to;
+
+            const labelText = t.action.length > 15 ? `${t.action.slice(0, 14)}…` : t.action;
+            const labelW = Math.max(46, labelText.length * 6 + 12);
 
             return (
-              <g key={t.id} className="transition-all duration-300">
+              <g key={t.id}>
                 <path
                   d={line.path}
                   fill="none"
-                  stroke={isTracePath || isSelfTrace ? '#f43f5e' : '#334155'}
-                  strokeWidth={isTracePath || isSelfTrace ? '3.5' : '1.8'}
-                  markerEnd={isTracePath || isSelfTrace ? 'url(#arrowhead-highlight)' : 'url(#arrowhead)'}
-                  className="transition-colors duration-200"
+                  stroke={isTraced ? '#f43f5e' : '#475569'}
+                  strokeWidth={isTraced ? 3 : 1.8}
+                  markerEnd={isTraced ? 'url(#arrowhead-trace)' : 'url(#arrowhead)'}
                 />
-                
-                {/* Visual Signal pulse traveling if this is active path */}
-                {(isTracePath || isSelfTrace) && (
+
+                {isTraced && (
                   <circle r="4" fill="#fb7185">
-                    <animateMotion dur="2.5s" repeatCount="indefinite" path={line.path} />
+                    <animateMotion dur="2.2s" repeatCount="indefinite" path={line.path} />
                   </circle>
                 )}
 
-                {/* Transition Action Trigger Label */}
                 <g transform={`translate(${line.labelX}, ${line.labelY})`}>
                   <rect
-                    px="2"
-                    py="1"
-                    x={-42}
-                    y={-10}
-                    width={84}
+                    x={-labelW / 2}
+                    y={-9}
+                    width={labelW}
                     height={18}
                     rx="4"
-                    fill="#0f172a"
-                    stroke={isTracePath || isSelfTrace ? '#e11d48' : '#1e293b'}
+                    fill="#020617"
+                    stroke={isTraced ? '#e11d48' : '#1e293b'}
                     strokeWidth="1"
-                    className="opacity-90"
                   />
                   <text
-                    fontSize="9 font-mono font-bold"
-                    fill={isTracePath || isSelfTrace ? '#fda4af' : '#94a3b8'}
+                    fontSize={9}
+                    fill={isTraced ? '#fda4af' : '#94a3b8'}
                     textAnchor="middle"
-                    alignmentBaseline="middle"
-                    className="font-mono"
+                    dominantBaseline="middle"
+                    className="code-fancy"
                   >
-                    {t.action.length > 13 ? `${t.action.slice(0, 11)}..` : t.action}
+                    {labelText}
                   </text>
                 </g>
               </g>
             );
           })}
 
-          {/* Draw States (Bubbles) */}
-          {states.map((s) => {
+          {/* States */}
+          {states.map(s => {
             const isActiveSim = activeStateId === s.id;
-            const isTraceChecked = highlightedPath.includes(s.id);
-            const isViolatedNode = violationStateId === s.id;
-            const isSelectedNode = selectedNodeId === s.id;
+            const isTraced = highlightedPath.includes(s.id);
+            const isViolated = violationStateId === s.id;
+            const isSelected = selectedNodeId === s.id;
+            const isUnreachable = unreachable.has(s.id);
 
-            // Determine border color and ring scale
-            let strokeColor = '#475569';
-            if (isSelectedNode) strokeColor = '#6366f1';
-            if (isTraceChecked) strokeColor = '#fb7185';
-            if (isActiveSim) strokeColor = '#38bdf8';
-            if (isViolatedNode) strokeColor = '#ef4444';
+            let stroke = '#475569';
+            if (isSelected) stroke = '#6366f1';
+            if (isTraced) stroke = '#fb7185';
+            if (isActiveSim) stroke = '#38bdf8';
+            if (isViolated) stroke = '#ef4444';
 
             return (
               <g
                 key={s.id}
                 transform={`translate(${s.x}, ${s.y})`}
                 className="cursor-pointer"
-                onMouseDown={(e) => handleMouseDown(e, s.id)}
-                onTouchStart={(e) => handleTouchStart(e, s.id)}
+                opacity={isUnreachable ? 0.4 : 1}
+                onMouseDown={e => {
+                  e.preventDefault();
+                  beginDrag(e.clientX, e.clientY, s.id);
+                }}
+                onTouchStart={e => {
+                  if (e.touches.length > 0) beginDrag(e.touches[0].clientX, e.touches[0].clientY, s.id);
+                }}
                 onClick={() => {
+                  if (movedRef.current) return; // that was a drag, not a click
                   setSelectedNodeId(s.id);
-                  // Allow manual walking/simulation click if connected to active state
-                  const isConnectedFromActive = transitions.some(t => t.from === activeStateId && t.to === s.id);
-                  if (isConnectedFromActive || s.isInitial) {
-                    onActiveStateChange(s.id);
-                  }
+                  const reachableFromActive = transitions.some(t => t.from === activeStateId && t.to === s.id);
+                  if (reachableFromActive || s.isInitial) onActiveStateChange(s.id);
                 }}
               >
-                {/* Active model checking visual ping effect */}
+                <title>
+                  {`${s.label} (${s.id})${isUnreachable ? ' — unreachable from the initial state' : ''}`}
+                </title>
+
                 {isActiveSim && (
-                  <circle
-                    r="48"
-                    fill="none"
-                    stroke="#38bdf8"
-                    strokeWidth="1.5"
-                    className="animate-ping opacity-25"
-                  />
+                  <circle r="48" fill="none" stroke="#38bdf8" strokeWidth="1.5" className="animate-ping opacity-25" />
                 )}
 
-                {/* Main bubble body */}
                 <circle
-                  r="38"
-                  fill={isViolatedNode ? '#7f1d1d' : isActiveSim ? '#0c4a6e' : isSelectedNode ? '#1e1b4b' : '#030712'}
-                  stroke={strokeColor}
-                  strokeWidth={isActiveSim || isSelectedNode ? '3.5' : '2'}
-                  className="transition-colors duration-200"
+                  r={NODE_R}
+                  fill={isViolated ? '#7f1d1d' : isActiveSim ? '#0c4a6e' : isSelected ? '#1e1b4b' : '#020617'}
+                  stroke={stroke}
+                  strokeWidth={isActiveSim || isSelected ? 3.5 : 2}
+                  strokeDasharray={isUnreachable ? '4,3' : undefined}
                 />
 
-                {/* If Initial State Indicator */}
-                {s.isInitial && (
-                  <circle
-                    cx="-25"
-                    cy="-25"
-                    r="6"
-                    fill="#10b981"
-                    stroke="#022c22"
-                    strokeWidth="1.5"
-                  />
-                )}
+                {s.isInitial && <circle cx="-26" cy="-26" r="6" fill="#10b981" stroke="#022c22" strokeWidth="1.5" />}
 
-                {/* Inner State Proposition Toggles preview indicators (small colored pills) */}
-                <g transform="translate(0, 16)">
-                  {s.innerOpen && <circle cx="-12" cy="0" r="4.5" fill="#f43f5e" title={getMetaphorLabel('innerOpen')} />}
-                  {s.outerOpen && <circle cx="0" cy="0" r="4.5" fill="#eab308" title={getMetaphorLabel('outerOpen')} />}
-                  {s.pressurized && <circle cx="12" cy="0" r="4.5" fill="#10b981" title={getMetaphorLabel('pressurized')} />}
+                <g transform="translate(0, 17)">
+                  {s.innerOpen && <circle cx="-12" cy="0" r="4.5" fill="#f43f5e" />}
+                  {s.outerOpen && <circle cx="0" cy="0" r="4.5" fill="#eab308" />}
+                  {s.pressurized && <circle cx="12" cy="0" r="4.5" fill="#10b981" />}
                 </g>
 
-                {/* State Human Name */}
                 <text
-                  fontSize="11"
-                  fill={isActiveSim ? '#f0f9ff' : isViolatedNode ? '#fee2e2' : '#e2e8f0'}
+                  fontSize={11}
+                  fill={isActiveSim ? '#f0f9ff' : isViolated ? '#fee2e2' : '#e2e8f0'}
                   textAnchor="middle"
                   fontWeight="bold"
                   y="-4"
-                  className="font-sans"
                 >
-                  {s.label.length > 11 ? `${s.label.slice(0, 9)}..` : s.label}
+                  {s.label.length > 13 ? `${s.label.slice(0, 12)}…` : s.label}
                 </text>
 
-                {/* Small indicator explaining variables */}
-                <text
-                  fontSize="8"
-                  fill="#64748b"
-                  textAnchor="middle"
-                  y="6"
-                  className="font-mono uppercase tracking-wide leading-none"
-                >
+                <text fontSize={8} fill="#64748b" textAnchor="middle" y="7" className="code-fancy">
                   {s.id}
                 </text>
               </g>
@@ -481,241 +427,218 @@ export default function KripkeEditor({
           })}
         </svg>
 
-        {/* Live play directions on footer */}
-        <div className="absolute bottom-3 left-4 right-4 flex justify-between items-center bg-slate-900/80 backdrop-blur-md px-3 py-2 rounded-lg border border-slate-800/80 pointer-events-none">
-          <div className="flex items-center gap-2">
-            <span className="w-2.5 h-2.5 rounded-full bg-cyan-400 animate-pulse"></span>
-            <span className="text-[10px] font-mono text-slate-300">
-              Active Simulation state: <strong className="text-cyan-300 font-bold">{states.find(s => s.id === activeStateId)?.label || 'None'}</strong>
-            </span>
-          </div>
-          <span className="text-[10px] font-mono text-slate-400">
-            💡 Click on neighboring connected nodes to cycle/test manually
+        <div className="flex justify-between items-center gap-3 flex-wrap bg-slate-900/80 px-3 py-2 border-t border-slate-800">
+          <span className="text-[10px] code-fancy text-slate-300">
+            Simulation at:{' '}
+            <strong className="text-cyan-300">{states.find(s => s.id === activeStateId)?.label ?? 'none'}</strong>
+          </span>
+          <span className="text-[10px] code-fancy text-slate-500">
+            Click a connected neighbour to step through the machine by hand
           </span>
         </div>
       </div>
 
-      {/* Editor & Parameters Inspector panel */}
-      <div className="flex flex-col gap-5 bg-slate-950/45 rounded-xl border border-slate-800/80 p-5 overflow-y-auto max-h-[460px]">
+      {/* Inspector */}
+      <div className="flex flex-col gap-5 bg-slate-950/50 rounded-xl border border-slate-800 p-5 overflow-y-auto max-h-[560px]">
         {selectedNode ? (
           <div className="flex flex-col gap-4">
-            <div className="flex justify-between items-center border-b border-slate-800/80 pb-3">
-              <div className="flex flex-col">
-                <span className="text-[10px] font-mono text-indigo-400 font-semibold uppercase tracking-wider">Node Inspector</span>
-                <h3 className="text-sm font-bold text-slate-100 flex items-center gap-1.5 leading-none mt-1">
-                  {selectedNode.label}
-                </h3>
+            <div className="flex justify-between items-center border-b border-slate-800 pb-3">
+              <div className="flex flex-col min-w-0">
+                <span className="text-[10px] code-fancy text-indigo-400 font-semibold uppercase tracking-wider">
+                  State inspector
+                </span>
+                <h3 className="text-sm font-bold text-slate-100 leading-none mt-1 truncate">{selectedNode.label}</h3>
               </div>
-              
+
               {allowEditing && !selectedNode.isInitial && (
                 <button
                   onClick={() => deleteState(selectedNode.id)}
-                  className="p-1.5 rounded-md hover:bg-rose-500/15 border border-transparent hover:border-rose-500/30 text-rose-400 transition"
-                  title="Delete State"
+                  className="p-1.5 rounded-md hover:bg-rose-500/15 border border-transparent hover:border-rose-500/30 text-rose-400 transition shrink-0"
+                  title="Delete this state"
                 >
                   <Trash size={14} />
                 </button>
               )}
             </div>
 
-            {/* Input Name */}
             <div>
-              <label className="block text-[10px] font-mono text-slate-400 uppercase mb-1.5 font-bold">Node Label</label>
+              <label className="block text-[10px] code-fancy text-slate-400 uppercase mb-1.5 font-bold" htmlFor="node-label">
+                Name
+              </label>
               <input
+                id="node-label"
                 type="text"
                 value={selectedNode.label}
                 disabled={!allowEditing}
-                onChange={(e) => {
-                  onStatesChange(states.map(s => s.id === selectedNode.id ? { ...s, label: e.target.value } : s));
-                }}
-                className="w-full text-xs font-semibold px-2.5 py-2 bg-slate-900 border border-slate-800 hover:border-slate-750 focus:border-indigo-500 focus:outline-none rounded-lg text-slate-200 transition"
+                onChange={e =>
+                  onStatesChange(states.map(s => (s.id === selectedNode.id ? { ...s, label: e.target.value } : s)))
+                }
+                className="w-full text-xs font-semibold px-2.5 py-2 bg-slate-900 border border-slate-800 focus:border-indigo-500 focus:outline-none rounded-lg text-slate-200 transition disabled:opacity-60"
               />
             </div>
 
-            {/* Init Node Toggler */}
             {allowEditing && (
-              <div className="flex items-center justify-between py-2.5 px-3 bg-slate-900/50 rounded-lg border border-slate-850">
+              <div className="flex items-center justify-between py-2.5 px-3 bg-slate-900/60 rounded-lg border border-slate-800">
                 <div className="flex flex-col">
                   <span className="text-xs font-semibold text-slate-200 flex items-center gap-1.5">
-                    <CircleDot size={13} className="text-green-400" />
-                    Initial State
+                    <CircleDot size={13} className="text-emerald-400" /> Initial state
                   </span>
-                  <span className="text-[9px] text-slate-500 mt-0.5 font-mono">Verification starts here</span>
+                  <span className="text-[9px] text-slate-500 mt-0.5 code-fancy">Verification starts here</span>
                 </div>
                 <button
                   type="button"
                   onClick={() => setAsInitial(selectedNode.id)}
-                  className={`px-2 py-1 text-[10px] font-mono font-bold uppercase rounded border transition ${
+                  className={`px-2 py-1 text-[10px] code-fancy font-bold uppercase rounded border transition ${
                     selectedNode.isInitial
-                      ? 'bg-green-500/10 text-green-400 border-green-500/20'
+                      ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30'
                       : 'bg-slate-900 text-slate-400 border-slate-800 hover:border-indigo-500'
                   }`}
                 >
-                  {selectedNode.isInitial ? 'YES' : 'SET'}
+                  {selectedNode.isInitial ? 'Yes' : 'Set'}
                 </button>
               </div>
             )}
 
-            {/* State Propositions Section */}
             <div className="flex flex-col gap-2.5">
-              <label className="block text-[10px] font-mono text-indigo-400 uppercase font-bold">Active Properties</label>
-              
-              {/* Prop 1 */}
-              <div className="flex items-center justify-between py-2 px-2.5 bg-slate-900/40 border border-slate-800 rounded-lg">
-                <span className="text-xs font-semibold text-slate-300">{getMetaphorLabel('innerOpen')}</span>
-                <button
-                  onClick={() => toggleStateProp(selectedNode.id, 'innerOpen')}
-                  className="text-slate-400 hover:text-slate-100 transition"
-                >
-                  {selectedNode.innerOpen ? (
-                    <span className="flex items-center gap-1 font-mono text-[9px] font-bold text-rose-400">
-                      TRUE <ToggleRight className="text-rose-400" size={20} />
-                    </span>
-                  ) : (
-                    <span className="flex items-center gap-1 font-mono text-[9px] font-bold text-slate-500">
-                      FALSE <ToggleLeft className="text-slate-600" size={20} />
-                    </span>
-                  )}
-                </button>
-              </div>
+              <span className="block text-[10px] code-fancy text-indigo-400 uppercase font-bold">
+                Atomic propositions
+              </span>
 
-              {/* Prop 2 */}
-              <div className="flex items-center justify-between py-2 px-2.5 bg-slate-900/40 border border-slate-800 rounded-lg">
-                <span className="text-xs font-semibold text-slate-300">{getMetaphorLabel('outerOpen')}</span>
-                <button
-                  onClick={() => toggleStateProp(selectedNode.id, 'outerOpen')}
-                  className="text-slate-400 hover:text-slate-100 transition"
-                >
-                  {selectedNode.outerOpen ? (
-                    <span className="flex items-center gap-1 font-mono text-[9px] font-bold text-yellow-400">
-                      TRUE <ToggleRight className="text-yellow-400" size={20} />
-                    </span>
-                  ) : (
-                    <span className="flex items-center gap-1 font-mono text-[9px] font-bold text-slate-500">
-                      FALSE <ToggleLeft className="text-slate-600" size={20} />
-                    </span>
-                  )}
-                </button>
-              </div>
-
-              {/* Prop 3 */}
-              <div className="flex items-center justify-between py-2 px-2.5 bg-slate-900/40 border border-slate-800 rounded-lg">
-                <span className="text-xs font-semibold text-slate-300">{getMetaphorLabel('pressurized')}</span>
-                <button
-                  onClick={() => toggleStateProp(selectedNode.id, 'pressurized')}
-                  className="text-slate-400 hover:text-slate-100 transition"
-                >
-                  {selectedNode.pressurized ? (
-                    <span className="flex items-center gap-1 font-mono text-[9px] font-bold text-emerald-400">
-                      TRUE <ToggleRight className="text-emerald-400" size={20} />
-                    </span>
-                  ) : (
-                    <span className="flex items-center gap-1 font-mono text-[9px] font-bold text-slate-500">
-                      FALSE <ToggleLeft className="text-slate-600" size={20} />
-                    </span>
-                  )}
-                </button>
-              </div>
+              {PROPS.map(({ key, colour }) => {
+                const on = selectedNode[key];
+                return (
+                  <div
+                    key={key}
+                    className="flex items-center justify-between gap-2 py-2 px-2.5 bg-slate-900/50 border border-slate-800 rounded-lg"
+                  >
+                    <span className="text-[11px] font-semibold text-slate-300 leading-tight">{getPropLabel(key)}</span>
+                    <button
+                      onClick={() => toggleStateProp(selectedNode.id, key)}
+                      disabled={!allowEditing}
+                      aria-pressed={on}
+                      className="text-slate-400 hover:text-slate-100 transition disabled:opacity-50 shrink-0"
+                    >
+                      <span
+                        className={`flex items-center gap-1 code-fancy text-[9px] font-bold ${on ? colour : 'text-slate-500'}`}
+                      >
+                        {on ? 'TRUE' : 'FALSE'}
+                        {on ? <ToggleRight size={20} /> : <ToggleLeft size={20} className="text-slate-600" />}
+                      </span>
+                    </button>
+                  </div>
+                );
+              })}
             </div>
 
-            {/* Sandbox creation of transitions */}
             {allowEditing && (
-              <div className="border-t border-slate-800/80 pt-3.5 mt-1.5 flex flex-col gap-3">
-                <span className="text-[10px] font-mono text-indigo-400 uppercase font-bold">Add Transition Arc</span>
+              <div className="border-t border-slate-800 pt-3.5 flex flex-col gap-3">
+                <span className="text-[10px] code-fancy text-indigo-400 uppercase font-bold">Add a transition</span>
                 <form onSubmit={addTransition} className="flex flex-col gap-2">
                   <div className="grid grid-cols-2 gap-2">
                     <div>
-                      <label className="text-[8px] uppercase font-mono text-slate-500 block mb-1">From</label>
+                      <label className="text-[8px] uppercase code-fancy text-slate-500 block mb-1">From</label>
                       <select
                         value={newTransFrom}
-                        onChange={(e) => setNewTransFrom(e.target.value)}
-                        className="w-full text-xs font-semibold px-2 py-1.5 bg-slate-900 border border-slate-800 text-slate-200 rounded focus:outline-none"
+                        onChange={e => setNewTransFrom(e.target.value)}
+                        className="w-full text-xs font-semibold px-2 py-1.5 bg-slate-900 border border-slate-800 text-slate-200 rounded focus:outline-none focus:border-indigo-500"
                       >
-                        <option value="">Select...</option>
-                        {states.map(s => <option key={s.id} value={s.id}>{s.label}</option>)}
+                        <option value="">Select…</option>
+                        {states.map(s => (
+                          <option key={s.id} value={s.id}>
+                            {s.label}
+                          </option>
+                        ))}
                       </select>
                     </div>
                     <div>
-                      <label className="text-[8px] uppercase font-mono text-slate-500 block mb-1">To State</label>
+                      <label className="text-[8px] uppercase code-fancy text-slate-500 block mb-1">To</label>
                       <select
                         value={newTransTo}
-                        onChange={(e) => setNewTransTo(e.target.value)}
-                        className="w-full text-xs font-semibold px-2 py-1.5 bg-slate-900 border border-slate-800 text-slate-200 rounded focus:outline-none"
+                        onChange={e => setNewTransTo(e.target.value)}
+                        className="w-full text-xs font-semibold px-2 py-1.5 bg-slate-900 border border-slate-800 text-slate-200 rounded focus:outline-none focus:border-indigo-500"
                       >
-                        <option value="">Select...</option>
-                        {states.map(s => <option key={s.id} value={s.id}>{s.label}</option>)}
+                        <option value="">Select…</option>
+                        {states.map(s => (
+                          <option key={s.id} value={s.id}>
+                            {s.label}
+                          </option>
+                        ))}
                       </select>
                     </div>
                   </div>
 
                   <div>
-                    <label className="text-[8px] uppercase font-mono text-slate-500 block mb-0.5">Transition Label (Event/Command)</label>
+                    <label className="text-[8px] uppercase code-fancy text-slate-500 block mb-1">Event label</label>
                     <div className="flex gap-1.5">
                       <input
                         type="text"
-                        placeholder="e.g. Press cook"
+                        placeholder="e.g. Press start"
                         value={newTransAction}
-                        onChange={(e) => setNewTransAction(e.target.value)}
-                        className="flex-1 text-xs px-2 py-1.5 bg-slate-900 border border-slate-800 text-slate-200 rounded focus:outline-none focus:border-indigo-500"
+                        onChange={e => setNewTransAction(e.target.value)}
+                        className="flex-1 min-w-0 text-xs px-2 py-1.5 bg-slate-900 border border-slate-800 text-slate-200 rounded focus:outline-none focus:border-indigo-500"
                       />
                       <button
                         type="submit"
-                        disabled={!newTransFrom || !newTransTo || !newTransAction}
-                        className="px-2 py-1 bg-indigo-600 hover:bg-indigo-500 disabled:bg-slate-800 disabled:opacity-50 text-white rounded text-xs transition"
+                        disabled={!newTransFrom || !newTransTo || !newTransAction.trim()}
+                        className="px-2 py-1 bg-indigo-600 hover:bg-indigo-500 disabled:bg-slate-800 disabled:opacity-50 text-white rounded transition shrink-0"
+                        title="Add transition"
                       >
                         <Plus size={14} />
                       </button>
                     </div>
+                    {transitionError && <p className="text-[10px] text-rose-400 mt-1.5">{transitionError}</p>}
                   </div>
                 </form>
               </div>
             )}
           </div>
         ) : (
-          <div className="h-full flex flex-col justify-center items-center text-center p-6 text-slate-500">
+          <div className="flex flex-col justify-center items-center text-center p-6 text-slate-500">
             <HelpCircle size={32} className="opacity-20 mb-2" />
-            <span className="text-xs font-mono">Click a node to inspect and toggle properties.</span>
+            <span className="text-xs code-fancy">Click a state to inspect it.</span>
           </div>
         )}
 
-        {/* Floating Add State button inside editor list */}
         {allowEditing && (
-          <div className="border-t border-slate-800/80 pt-4 mt-auto">
-            <button
-              onClick={addNewState}
-              className="w-full py-2.5 bg-slate-900 hover:bg-indigo-950 border border-slate-800 hover:border-indigo-500/50 text-indigo-400 font-bold rounded-lg text-xs flex items-center justify-center gap-1.5 transition duration-150"
-            >
-              <Plus size={15} /> Add New State Bubble
-            </button>
-          </div>
+          <button
+            onClick={addNewState}
+            className="w-full py-2.5 bg-slate-900 hover:bg-indigo-950 border border-slate-800 hover:border-indigo-500/50 text-indigo-400 font-bold rounded-lg text-xs flex items-center justify-center gap-1.5 transition"
+          >
+            <Plus size={15} /> Add a state
+          </button>
         )}
 
-        {/* List of transitions */}
-        <div className="flex flex-col gap-2 mt-2">
-          <span className="text-[10px] font-mono text-slate-500 uppercase tracking-wider font-bold">Active Transitions Wirelist ({transitions.length})</span>
-          <div className="flex flex-col gap-1.5 max-h-[140px] overflow-y-auto">
-            {transitions.map((t) => {
-              const fromName = states.find(s => s.id === t.from)?.label || t.from;
-              const toName = states.find(s => s.id === t.to)?.label || t.to;
-              return (
-                <div key={t.id} className="flex justify-between items-center bg-slate-900/60 border border-slate-850 px-2 py-1.5 rounded text-[11px] font-mono text-slate-300">
-                  <div className="flex items-center gap-1 flex-1 min-w-0">
-                    <span className="text-orange-400 font-bold block truncate max-w-[50px]">{fromName}</span>
-                    <ArrowRight size={10} className="text-slate-500 shrink-0" />
-                    <span className="text-cyan-400 font-bold block truncate max-w-[50px]">{toName}</span>
-                    <span className="text-[10px] text-slate-400 block truncate italic shrink-0">({t.action})</span>
-                  </div>
-                  {allowEditing && (
-                    <button
-                      onClick={() => deleteTransition(t.id)}
-                      className="text-rose-400 hover:text-rose-300 p-0.5"
-                    >
-                      <Trash size={11} />
-                    </button>
-                  )}
+        <div className="flex flex-col gap-2 border-t border-slate-800 pt-4">
+          <span className="text-[10px] code-fancy text-slate-500 uppercase tracking-wider font-bold">
+            Transitions ({transitions.length})
+          </span>
+          <div className="flex flex-col gap-1.5 max-h-[160px] overflow-y-auto">
+            {transitions.map(t => (
+              <div
+                key={t.id}
+                className="flex justify-between items-center gap-1 bg-slate-900/60 border border-slate-800 px-2 py-1.5 rounded text-[11px] code-fancy text-slate-300"
+              >
+                <div className="flex items-center gap-1 flex-1 min-w-0">
+                  <span className="text-orange-400 font-bold truncate max-w-[54px]">
+                    {states.find(s => s.id === t.from)?.label ?? t.from}
+                  </span>
+                  <ArrowRight size={10} className="text-slate-500 shrink-0" />
+                  <span className="text-cyan-400 font-bold truncate max-w-[54px]">
+                    {states.find(s => s.id === t.to)?.label ?? t.to}
+                  </span>
+                  <span className="text-[10px] text-slate-500 truncate italic">({t.action})</span>
                 </div>
-              );
-            })}
+                {allowEditing && (
+                  <button
+                    onClick={() => onTransitionsChange(transitions.filter(x => x.id !== t.id))}
+                    className="text-rose-400 hover:text-rose-300 p-0.5 shrink-0"
+                    title={`Delete ${t.action}`}
+                  >
+                    <Trash size={11} />
+                  </button>
+                )}
+              </div>
+            ))}
           </div>
         </div>
       </div>

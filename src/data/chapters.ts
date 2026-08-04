@@ -3,176 +3,302 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { Chapter } from '../types';
+import { Chapter, TemporalProperty } from '../types';
+
+/* ------------------------------------------------------------------ */
+/* Sandbox properties the learner can switch between                   */
+/* ------------------------------------------------------------------ */
+
+const SANDBOX_PROPERTIES: TemporalProperty[] = [
+  {
+    id: 'sandbox_mutex_ab',
+    name: 'Mutual exclusion (A, B)',
+    description: 'Signals A and B are never on at the same time.',
+    formula: 'G ¬(A ∧ B)',
+    plainEnglish: 'At every moment, A and B are not both true.',
+    type: 'safety',
+    spec: { kind: 'invariant', bad: s => s.innerOpen && s.outerOpen },
+    explanation: 'Two signals that must never be on together are on together.'
+  },
+  {
+    id: 'sandbox_mutex_ac',
+    name: 'Mutual exclusion (A, C)',
+    description: 'Signals A and C are never on at the same time.',
+    formula: 'G ¬(A ∧ C)',
+    plainEnglish: 'At every moment, A and C are not both true.',
+    type: 'safety',
+    spec: { kind: 'invariant', bad: s => s.innerOpen && s.pressurized },
+    explanation: 'Two signals that must never be on together are on together.'
+  },
+  {
+    id: 'sandbox_response_bc',
+    name: 'Response: B leads to C',
+    description: 'Every time B turns on, C must follow.',
+    formula: 'G (B ⇒ F C)',
+    plainEnglish: 'Whenever B becomes true, C becomes true at some later point.',
+    type: 'liveness',
+    spec: { kind: 'response', p: s => s.outerOpen, q: s => s.pressurized },
+    explanation: 'B happens but the system can avoid C forever.'
+  },
+  {
+    id: 'sandbox_no_starvation',
+    name: 'No starvation: C leads back to A',
+    description: 'Once C is on, A must get its turn again.',
+    formula: 'G (C ⇒ F A)',
+    plainEnglish: 'Whenever C becomes true, A becomes true again at some later point.',
+    type: 'liveness',
+    spec: { kind: 'response', p: s => s.pressurized, q: s => s.innerOpen },
+    explanation: 'One part of the system can be starved: it waits forever for its turn.'
+  },
+  {
+    id: 'sandbox_no_deadlock',
+    name: 'No dead ends',
+    description: 'The machine can never freeze with nowhere to go.',
+    formula: 'G ¬deadlock',
+    plainEnglish: 'Every reachable state has at least one outgoing transition.',
+    type: 'safety',
+    spec: { kind: 'no_deadlock' },
+    explanation: 'A reachable state has no outgoing transitions, so the system stops forever.'
+  }
+];
+
+/* ------------------------------------------------------------------ */
+/* Chapters                                                            */
+/* ------------------------------------------------------------------ */
 
 export const CHAPTERS: Chapter[] = [
   {
     id: 1,
-    title: "1. The Decompression Catastrophe",
-    subtitle: "Safety is about what should NEVER happen.",
-    narrative: `Welcome to the Space Station Airlock! Safeguarding human lives in space is extremely hard. If both the **Inner Cabin Door** and the **Outer Space Door** are open at the same time, the cabin depressurizes instantly, sucking our intrepid astronaut into the vacuum of space!
+    title: '1. The Decompression Catastrophe',
+    subtitle: 'Safety: what must NEVER happen.',
+    metaphor: 'Space station airlock',
+    narrative: `Welcome to the space station airlock. If the **inner cabin door** and the **outer space door** are ever open at the same moment, the cabin empties into vacuum and our astronaut has a very bad day.
 
-In formal verification, we write a **Safety Property**: 'Something bad must never happen.' 
-Here, the bad thing is the state: **(Inner Door Open) AND (Outer Door Open)**.
-Our Safety target formula is:
-**G ¬(InnerOpen ∧ OuterOpen)**
-*(G means 'Globally' or 'Always' in temporal logic. This formula says: 'It is always true that doors are NOT both open.')*`,
-    task: "Explore the reactor/airlock. There is a faulty control sequence. Click the nodes in 'Model Live Simulation' to walk through transitions manually, or run the Model Checker! Find and eliminate the transition that allows both doors to be open at the same time.",
+A **safety property** says: *something bad never happens*. Here the bad thing is one single state — both doors open at once:
+
+\`G ¬(InnerOpen ∧ OuterOpen)\`
+
+**G** is the temporal operator *globally*, also read as *always*. The formula says: at every moment, along every run the machine can take, the two doors are not both open.
+
+A model checker does not test a few runs. It walks the **entire reachable state space** and either proves the formula for all of it, or hands you a **counterexample**: a concrete sequence of steps that reaches the bad state. Because this search is breadth-first, the counterexample you get is the *shortest* one — the smallest possible bug report.`,
+    task: 'Run the verifier. It will hand you a counterexample trail ending in DECOMPRESSION. Two "vent" transitions can reach that state — delete both, then verify again. Deleting the ordinary door controls also makes the checker pass, but a welded-shut airlock is not a fix, so the level will tell you if you took that shortcut.',
     initialStates: [
-      { id: 'off', label: 'Closed & Safe', innerOpen: false, outerOpen: false, pressurized: true, isInitial: true, x: 150, y: 150 },
-      { id: 'inner', label: 'Inner Open', innerOpen: true, outerOpen: false, pressurized: true, x: 380, y: 100 },
-      { id: 'outer', label: 'Outer Open', innerOpen: false, outerOpen: true, pressurized: false, x: 380, y: 320 },
-      { id: 'danger', label: 'DECOMPRESSION!', innerOpen: true, outerOpen: true, pressurized: false, x: 620, y: 210 }
+      { id: 'off', label: 'Sealed & Safe', innerOpen: false, outerOpen: false, pressurized: true, isInitial: true, x: 150, y: 200 },
+      { id: 'inner', label: 'Inner Open', innerOpen: true, outerOpen: false, pressurized: true, x: 390, y: 90 },
+      { id: 'outer', label: 'Outer Open', innerOpen: false, outerOpen: true, pressurized: false, x: 390, y: 320 },
+      { id: 'danger', label: 'DECOMPRESSION', innerOpen: true, outerOpen: true, pressurized: false, x: 640, y: 200 }
     ],
     initialTransitions: [
-      { id: 't1', from: 'off', to: 'inner', action: 'Open Inner' },
-      { id: 't2', from: 'inner', to: 'off', action: 'Close Inner' },
-      { id: 't3', from: 'off', to: 'outer', action: 'Open Outer' },
-      { id: 't4', from: 'outer', to: 'off', action: 'Close Outer' },
-      // The bug transition:
-      { id: 't_bug', from: 'inner', to: 'danger', action: 'Open Outer Door Vent' },
-      { id: 't_bug2', from: 'outer', to: 'danger', action: 'Open Inner Door Vent' },
-      { id: 't_escape', from: 'danger', to: 'off', action: 'Emergency Close' }
+      { id: 't1', from: 'off', to: 'inner', action: 'Open inner' },
+      { id: 't2', from: 'inner', to: 'off', action: 'Close inner' },
+      { id: 't3', from: 'off', to: 'outer', action: 'Open outer' },
+      { id: 't4', from: 'outer', to: 'off', action: 'Close outer' },
+      { id: 't_bug', from: 'inner', to: 'danger', action: 'Manual vent' },
+      { id: 't_bug2', from: 'outer', to: 'danger', action: 'Manual vent' },
+      { id: 't_escape', from: 'danger', to: 'off', action: 'Emergency seal' }
     ],
     targetProperty: {
       id: 'airlock_safety',
-      name: "Airlock Safety",
-      description: "Both doors must never be open concurrently.",
-      formula: "G ¬(InnerOpen ∧ OuterOpen)",
+      name: 'Airlock safety',
+      description: 'The two doors are never open at the same time.',
+      formula: 'G ¬(InnerOpen ∧ OuterOpen)',
+      plainEnglish: 'At every moment, the inner and outer doors are not both open.',
       type: 'safety',
-      isViolated: (s) => s.innerOpen && s.outerOpen,
-      explanation: "Cabin decompression occurs when both doors are opened simultaneously. This state is highly lethal."
+      spec: { kind: 'invariant', bad: s => s.innerOpen && s.outerOpen },
+      explanation: 'Both doors are open at the same time, which vents the cabin to vacuum.'
     },
-    successCondition: (states, transitions, checkResult) => {
-      // The user successfully completes Level 1 if they remove any transitions leading to an unsafe state,
-      // making 'danger' unreachable from the initial 'off' state.
-      return checkResult.success;
-    },
-    successMessage: "Superb! You deleted the rogue manual vent paths. Now, no matter what series of commands the automated pilot issues, both doors can never open at the same time! You saved our astronaut!",
+    sanityChecks: [
+      {
+        message: 'The airlock still has to work: the crew must be able to open the inner door.',
+        test: ({ reachable }) => reachable.has('inner')
+      },
+      {
+        message: 'The airlock still has to work: the crew must be able to open the outer door.',
+        test: ({ reachable }) => reachable.has('outer')
+      },
+      {
+        message: 'Keep the DECOMPRESSION state in the model. The goal is to make it unreachable, not to delete the hazard from the drawing.',
+        test: ({ states }) => states.some(s => s.innerOpen && s.outerOpen)
+      }
+    ],
+    successMessage: 'The manual vent paths are gone. Both doors still work independently, but no sequence of commands — in any order, at any time — can open them together. That is a proof, not a test run.',
     allowEditing: true
   },
+
   {
     id: 2,
-    title: "2. The Rogue Microwave",
-    subtitle: "Liveness is about what must EVENTUALLY happen.",
-    narrative: `Fabulous work! Safety properties are great, but there is a second pillar to formal verification: **Liveness**. Liveness properties state: 'Something good must eventually happen.'
+    title: '2. The Rogue Microwave',
+    subtitle: 'Liveness: what must EVENTUALLY happen.',
+    metaphor: 'Microwave oven',
+    narrative: `Safety alone is easy to satisfy — a machine that does nothing at all is perfectly safe. The second pillar of verification is **liveness**: *something good eventually happens*.
 
-Consider a smart microwave oven.
-- **InnerOpen** will represent: **Magnetron Heating is Running** 🔥
-- **OuterOpen** will represent: **Microwave Door is Open** 🚪
-- **Pressurized** will represent: **Cooking Cycled Completed** ⏱️
+In this microwave the three propositions mean:
+- **Heating** — the magnetron is on
+- **DoorOpen** — the door is open (the interlock keeps the magnetron off here)
+- **CookComplete** — the cycle finished
 
-Safety property: **G ¬(Heating ∧ DoorOpen)** (Never heat while the door is open!)
-Liveness property: **G (StartPressed ⇒ F CookingCompleted)** (If we press start, we must eventually finish cooking. 'F' stands for 'Future' or 'Eventually'. This means cooking shouldn't get stuck in an infinite loop!)`,
-    task: "Look at this microwave model. There is a liveness infinite loop (liveloock). If the door is opened while cooking, the system gets stuck in a loop and never completes cooking! Modify or complete the state transitions so that if the door is open, heating turns off, allowing the user to reset and complete cook.",
+\`G (Heating ⇒ F CookComplete)\`
+
+**F** is *finally*, also read as *eventually*. Together: at every moment, if heating starts, then at some later moment cooking completes.
+
+A liveness property can never be broken by a single state — only by an **infinite behaviour**. There are two shapes:
+- a **deadlock**, where the machine reaches a state with no way out at all
+- a **livelock**, where the machine loops forever, busy but making no progress
+
+The counterexample for a livelock is a **lasso**: a finite path into a loop, plus the loop itself.
+
+One honest warning about this formula. Opening the door pauses cooking, so a user who opens the door over and over can keep this microwave from ever finishing. That is a real run, and a strict checker will report it. It is not a design bug — it is the user's choice. So we verify under a **fairness assumption**: if an exit from a loop is available again and again, the system eventually takes it. Fairness is on by default; the switch above the log lets you turn it off and watch what changes.`,
+    task: 'Verify. The magnetron can enter "Timer Glitched" and spin there forever with the heat on — a livelock. Deleting the self-loop only turns it into a dead end, so try that first and read the new verdict. The real fix is to add a way out: a watchdog transition from Timer Glitched back to Idle.',
     initialStates: [
-      { id: 'ready', label: 'Idle & Closed', innerOpen: false, outerOpen: false, pressurized: false, isInitial: true, x: 150, y: 200 },
-      { id: 'heating', label: 'Heating Active', innerOpen: true, outerOpen: false, pressurized: false, x: 400, y: 100 },
-      { id: 'open_door', label: 'Door Open (Stopped)', innerOpen: false, outerOpen: true, pressurized: false, x: 400, y: 320 },
-      { id: 'done', label: 'Cook Complete', innerOpen: false, outerOpen: false, pressurized: true, x: 650, y: 200 }
+      { id: 'ready', label: 'Idle', innerOpen: false, outerOpen: false, pressurized: false, isInitial: true, x: 140, y: 200 },
+      { id: 'heating', label: 'Heating', innerOpen: true, outerOpen: false, pressurized: false, x: 370, y: 110 },
+      { id: 'paused', label: 'Door Open', innerOpen: false, outerOpen: true, pressurized: false, x: 370, y: 330 },
+      { id: 'stalled', label: 'Timer Glitched', innerOpen: true, outerOpen: false, pressurized: false, x: 610, y: 340 },
+      { id: 'done', label: 'Cook Complete', innerOpen: false, outerOpen: false, pressurized: true, x: 640, y: 120 }
     ],
     initialTransitions: [
-      { id: 'mt1', from: 'ready', to: 'heating', action: 'Press Start' },
-      { id: 'mt2', from: 'heating', to: 'done', action: 'Timer Expires' },
-      { id: 'mt3', from: 'open_door', to: 'ready', action: 'Close Door' },
-      // The bug: Opening the door while heating does NOT turn off heating, it goes to door open but maintains heating status!
-      // To simulate it, opening door transitions but is stuck or we lack a transition back.
-      { id: 'mt_bug', from: 'heating', to: 'open_door', action: 'Open Door' }
+      { id: 'mt1', from: 'ready', to: 'heating', action: 'Press start' },
+      { id: 'mt2', from: 'heating', to: 'done', action: 'Timer expires' },
+      { id: 'mt3', from: 'heating', to: 'paused', action: 'Open door' },
+      { id: 'mt4', from: 'paused', to: 'ready', action: 'Close door' },
+      { id: 'mt5', from: 'done', to: 'ready', action: 'Take food out' },
+      { id: 'mt_bug', from: 'heating', to: 'stalled', action: 'Timer chip glitch' },
+      { id: 'mt_bug2', from: 'stalled', to: 'stalled', action: 'Wait for timer' }
     ],
     targetProperty: {
       id: 'microwave_liveness',
-      name: "Microwave Liveness",
-      description: "If heating starts, cooking must eventually finish or safely reset.",
-      formula: "G (Heating ⇒ F CookComplete)",
+      name: 'Cooking always finishes',
+      description: 'Once the magnetron is on, the cycle must eventually complete.',
+      formula: 'G (Heating ⇒ F CookComplete)',
+      plainEnglish: 'Whenever the magnetron turns on, the cook cycle completes at some later moment.',
       type: 'liveness',
-      isViolated: (s, allStates) => {
-        // Technically, a liveness violation is an infinite cycle that never reaches 'done'.
-        // For educational simpleness, we will detect if there is a cycle starting from 'heating' that can never reach 'done'
-        // or if 'open_door' is a dead-end that cannot reach 'done'.
-        return false; // we calculate this dynamically in the model checker!
+      spec: {
+        kind: 'response',
+        p: s => s.innerOpen,
+        q: s => s.pressurized
       },
-      explanation: "If you press Start, the microwave must eventually reach the Completed state, or go back to Safety. It must not hang in an infinite loop."
+      explanation: 'The magnetron can be left running with no route back to a completed cycle.'
     },
-    successCondition: (states, transitions, checkResult) => {
-      // User must create a path from 'open_door' back to 'ready' or 'done', and make sure heating turns off.
-      // Specifically, we check if the model checker reports success for Liveness property.
-      return checkResult.success;
-    },
-    successMessage: "Amazing! You successfully routed the door-open state back to safe closure and shutdown. The microwave safety-interlock logic now passes all automated verification checks. Delicious food is served safely!",
+    showFairnessToggle: true,
+    sanityChecks: [
+      {
+        message: 'The microwave still has to cook: "Cook Complete" must be reachable.',
+        test: ({ reachable }) => reachable.has('done')
+      },
+      {
+        message: 'The user must still be able to open the door mid-cycle — do not solve this by removing the door.',
+        test: ({ reachable }) => reachable.has('paused')
+      },
+      {
+        message: 'Keep the "Timer Glitched" state. Hardware faults happen; the job is to recover from them, not to pretend they do not exist.',
+        test: ({ reachable }) => reachable.has('stalled')
+      }
+    ],
+    successMessage: 'The watchdog gives the glitched timer a way back into the normal cycle. Now every fair run that starts heating ends at Cook Complete — including the runs where the timer chip misbehaves.',
     allowEditing: true
   },
+
   {
     id: 3,
-    title: "3. The Autonomous Rover Hatch",
-    subtitle: "Exploring CTL: Branching Paths & Counterexamples.",
-    narrative: `On Mars, errors cannot be fixed by a field technician. You are verifying the airpress hatch of a Mars Rover.
-- **InnerOpen** = Martian Dust Storm External Hatch Open 💨
-- **OuterOpen** = Internal Sample Container Open 🧪
-- **Pressurized** = Safe Shield engaged 🛡️
+    title: '3. The Autonomous Rover Hatch',
+    subtitle: 'Branching time, and the fairness assumption.',
+    metaphor: 'Mars rover sample hatch',
+    narrative: `On Mars nobody can reboot the rover for you. You are verifying the sample hatch controller.
 
-Safety constraint: **G ¬(DustStormHatch ∧ InternalContainerOpen)** (Never expose Mars dirt to inner crew modules!)
-Liveness constraint: **A G (HatchRequested ⇒ A F HatchOpen)** (Hatch must always eventually open when requested. 'AG' means 'Every Path, Globally' and 'AF' means 'Every Path, Eventually' in CTL).`,
-    task: "The Rover hatch control software gets deadlocked in a self-loop when a dusty environment is detected. Find the deadlock node and delete the self-loop so it can recover, check, and succeed!",
+- **HatchOpen** — the external hatch is open
+- **RequestPending** — an open command is waiting to be served
+- **ShieldEngaged** — the dust shield is up
+
+\`AG (RequestPending ⇒ AF HatchOpen)\`
+
+Chapters 1 and 2 used **LTL**, which talks about one run at a time. This is **CTL**, which talks about the *branching tree* of futures, so it needs a path quantifier in front of each temporal operator:
+- **A** — *along all paths*
+- **E** — *along at least one path*
+
+So **AG** is "on every path, at every moment" and **AF** is "on every path, at some moment". Read together: no matter which branch the rover takes, a pending request always gets served. (Every LTL formula in this app is implicitly A-quantified — that is why chapter 1's \`G\` and this chapter's \`AG\` mean the same thing here.)
+
+This chapter is really about **fairness**. The rover can detect a dust storm and wait. Waiting is correct behaviour. But "wait" and "wait forever" are different things, and the difference is exactly what the fairness switch controls:
+- **Fairness off** — an exit that is available forever must still be taken *at some point*, otherwise it counts as a bug. Any retry loop fails.
+- **Fairness on** — we assume an exit that stays available is eventually taken. Only a loop with *no* route out at all counts as a bug.
+
+Real verification tools make you state this assumption explicitly, because without it almost every retry loop reports a false alarm.`,
+    task: 'Verify with fairness ON. The rover falls into "Storm Hold" and retries forever with no way out — a genuine livelock. Give it a route back: point the retry transition at "Request Pending" instead of at itself. Then flip fairness OFF and run again to see why the assumption matters.',
     initialStates: [
-      { id: 'idle', label: 'Rover Idle', innerOpen: false, outerOpen: false, pressurized: true, isInitial: true, x: 150, y: 220 },
-      { id: 'request', label: 'Hatch Requested', innerOpen: false, outerOpen: false, pressurized: true, x: 380, y: 110 },
-      { id: 'dust_wait', label: 'Storm Deadlock Loop', innerOpen: false, outerOpen: false, pressurized: false, x: 380, y: 330 },
-      { id: 'hatch_active', label: 'Hatch Open & Ext', innerOpen: true, outerOpen: false, pressurized: false, x: 620, y: 220 }
+      { id: 'idle', label: 'Rover Idle', innerOpen: false, outerOpen: false, pressurized: true, isInitial: true, x: 140, y: 210 },
+      { id: 'request', label: 'Request Pending', innerOpen: false, outerOpen: true, pressurized: true, x: 380, y: 110 },
+      { id: 'dust_wait', label: 'Storm Hold', innerOpen: false, outerOpen: true, pressurized: false, x: 380, y: 330 },
+      { id: 'hatch_open', label: 'Hatch Open', innerOpen: true, outerOpen: false, pressurized: false, x: 630, y: 210 }
     ],
     initialTransitions: [
-      { id: 'rt1', from: 'idle', to: 'request', action: 'Trigger Open' },
-      { id: 'rt2', from: 'request', to: 'hatch_active', action: 'Shield Off & Open' },
-      { id: 'rt3', from: 'hatch_active', to: 'idle', action: 'Close Hatch' },
-      // Rogue deadlock self transitions
-      { id: 'rt_deadlock_tr', from: 'request', to: 'dust_wait', action: 'Dust Detected' },
+      { id: 'rt1', from: 'idle', to: 'request', action: 'Queue sample' },
+      { id: 'rt2', from: 'request', to: 'hatch_open', action: 'Shield off, open' },
+      { id: 'rt3', from: 'hatch_open', to: 'idle', action: 'Close hatch' },
+      { id: 'rt4', from: 'request', to: 'dust_wait', action: 'Dust detected' },
       { id: 'rt_self_loop', from: 'dust_wait', to: 'dust_wait', action: 'Retry forever' }
     ],
     targetProperty: {
-      id: 'rover_safety',
-      name: "Martian Safety & Progress",
-      description: "If a hatch is requested, it must eventually open, regardless of weather interruptions.",
-      formula: "AG (Request ⇒ AF HatchOpen)",
+      id: 'rover_progress',
+      name: 'Requests are always served',
+      description: 'A pending hatch request must eventually be served on every path.',
+      formula: 'AG (RequestPending ⇒ AF HatchOpen)',
+      plainEnglish: 'On every path, whenever a request is pending, the hatch opens at some later moment.',
       type: 'liveness',
-      isViolated: () => false, // Evaluated dynamically
-      explanation: "A deadlock infinite loop in dust_wait prevents the hatch from ever opening, leaving the command pending forever."
+      spec: {
+        kind: 'response',
+        p: s => s.outerOpen,
+        q: s => s.innerOpen
+      },
+      explanation: 'A pending request can be left unserved forever.'
     },
-    successCondition: (states, transitions, checkResult) => {
-      return checkResult.success;
-    },
-    successMessage: "Spectacular! You deleted the infinite Martian retry loop. Instead of hanging forever when dust is detected, the rover can safely timeout or fall back to autonomous landing clearance!",
+    showFairnessToggle: true,
+    sanityChecks: [
+      {
+        message: 'The rover must still be able to detect a storm — "Storm Hold" has to stay reachable.',
+        test: ({ reachable }) => reachable.has('dust_wait')
+      },
+      {
+        message: 'The hatch must still be able to open.',
+        test: ({ reachable }) => reachable.has('hatch_open')
+      }
+    ],
+    successMessage: 'Storm Hold now returns to Request Pending instead of spinning in place. Under fairness the storm eventually clears and the hatch opens on every path — and with fairness off you can see the retry loop reported as a counterexample, which is exactly why the assumption has to be written down.',
     allowEditing: true
   },
+
   {
     id: 4,
-    title: "4. The Verification Sandbox",
-    subtitle: "Build, Hack, & Verify your own algorithms!",
-    narrative: `You are now a certified Formal Verification engineer! You have the keys to the entire verification lab.
+    title: '4. The Verification Sandbox',
+    subtitle: 'Build a machine, pick a property, break it on purpose.',
+    metaphor: 'Traffic signal controller',
+    narrative: `You now have the whole lab. Add states, wire transitions, toggle the three propositions, choose which property to check, and flip the fairness assumption.
 
-Here, you can build *any* state machine you like. Add states, mark which ones are initial, toggle atomic variables (propositions), drag transitions, and write customized verification formulas. Play with safety, change transition labels, and trigger the model checker.
+The starting model is a traffic signal cycling A → B → C → A. Five properties are available in the picker:
+- \`G ¬(A ∧ B)\` and \`G ¬(A ∧ C)\` — **safety**, checked state by state
+- \`G (B ⇒ F C)\` and \`G (C ⇒ F A)\` — **liveness**, checked by hunting for loops and dead ends
+- \`G ¬deadlock\` — no reachable state may be a dead end
 
-See how a Model Checker sweeps every possible branch, uncovering tricky 'edge-case' bugs that standard unit testing could never find.`,
-    task: "Design a Traffic Light or a simple Elevators system. Make a loop, write a custom formula, and click Verify to see if there is any violation path!",
+Things worth trying, because each one produces a different kind of verdict:
+- add a state with A and B both on, and wire it into the cycle → a **safety** counterexample
+- add a state with a self-loop and no exit → a **deadlock**, then a **livelock** once you give it a partner to loop with
+- delete the transition that turns B on, then check \`G (B ⇒ F C)\` → a **vacuous pass**, where the property holds only because the trigger never happens
+- leave a state disconnected → the checker reports it as unreachable and ignores it, because unreachable states cannot break anything
+
+That last one is the whole idea in miniature: a model checker only reasons about behaviour the system can actually produce.`,
+    task: 'Build something, then try to break it. The counterexample trail under each verdict is clickable — use it to walk the failing run on the canvas.',
     initialStates: [
-      { id: 's0', label: 'Green Go', innerOpen: true, outerOpen: false, pressurized: true, isInitial: true, x: 200, y: 200 },
-      { id: 's1', label: 'Yellow Care', innerOpen: false, outerOpen: true, pressurized: true, x: 450, y: 120 },
-      { id: 's2', label: 'Red Stop', innerOpen: false, outerOpen: false, pressurized: false, x: 450, y: 320 }
+      { id: 's0', label: 'Signal A', innerOpen: true, outerOpen: false, pressurized: false, isInitial: true, x: 200, y: 210 },
+      { id: 's1', label: 'Signal B', innerOpen: false, outerOpen: true, pressurized: false, x: 450, y: 110 },
+      { id: 's2', label: 'Signal C', innerOpen: false, outerOpen: false, pressurized: true, x: 450, y: 330 }
     ],
     initialTransitions: [
-      { id: 'st1', from: 's0', to: 's1', action: 'Alert timer' },
-      { id: 'st2', from: 's1', to: 's2', action: 'Stop signal' },
-      { id: 'st3', from: 's2', to: 's0', action: 'Clear intersection' }
+      { id: 'st1', from: 's0', to: 's1', action: 'A → B' },
+      { id: 'st2', from: 's1', to: 's2', action: 'B → C' },
+      { id: 'st3', from: 's2', to: 's0', action: 'C → A' }
     ],
-    targetProperty: {
-      id: 'sandbox_custom',
-      name: "Custom Safety Rule",
-      description: "Ensure green and yellow are not on concurrently.",
-      formula: "G ¬(Variable1 ∧ Variable2)",
-      type: 'safety',
-      isViolated: (s) => s.innerOpen && s.outerOpen,
-      explanation: "Custom rule checking if your machine has two concurrent door/light indicators active."
-    },
-    successCondition: () => true, // Sandbox is always completed by exploring
-    successMessage: "Awesome playground exploration! You did fantastic.",
+    targetProperty: SANDBOX_PROPERTIES[0],
+    propertyOptions: SANDBOX_PROPERTIES,
+    showFairnessToggle: true,
+    successMessage: 'Nice. The sandbox has no win condition — every verdict here, pass or fail, is telling you something true about the machine you drew.',
     allowEditing: true
   }
 ];

@@ -5,253 +5,292 @@
 
 import { KripkeState, KripkeTransition, TemporalProperty, ModelCheckerStep } from '../types';
 
+export type CheckOutcome =
+  | 'ok'
+  | 'vacuous'
+  | 'safety_violation'
+  | 'deadlock'
+  | 'livelock'
+  | 'no_initial';
+
 export interface VerificationResult {
   success: boolean;
+  outcome: CheckOutcome;
   steps: ModelCheckerStep[];
-  trace?: string[]; // Array of state IDs in the counterexample path
-  lassoIndex?: number; // For liveness, index in trace where loop starts
+  /** Counterexample as a list of state ids, starting at the initial state. */
+  trace?: string[];
+  /** Index in `trace` where the repeating loop starts (a "lasso"). */
+  lassoIndex?: number;
   errorStateId?: string;
+  reachable: string[];
+  unreachable: string[];
   message: string;
+  /** A nudge shown under the verdict. */
+  hint?: string;
+}
+
+interface Edge {
+  to: string;
+  action: string;
+}
+
+/* ------------------------------------------------------------------ */
+/* Graph helpers                                                       */
+/* ------------------------------------------------------------------ */
+
+function buildSuccessors(states: KripkeState[], transitions: KripkeTransition[]): Map<string, Edge[]> {
+  const succ = new Map<string, Edge[]>();
+  states.forEach(s => succ.set(s.id, []));
+  transitions.forEach(t => {
+    if (succ.has(t.from) && succ.has(t.to)) {
+      succ.get(t.from)!.push({ to: t.to, action: t.action });
+    }
+  });
+  return succ;
+}
+
+/** Breadth-first search. Returns visit order and parent pointers (shortest paths). */
+function bfs(
+  startIds: string[],
+  succ: Map<string, Edge[]>,
+  allowed?: Set<string>
+): { visited: Set<string>; parent: Map<string, string | null>; order: string[] } {
+  const visited = new Set<string>();
+  const parent = new Map<string, string | null>();
+  const order: string[] = [];
+  const queue: string[] = [];
+
+  for (const id of startIds) {
+    if (allowed && !allowed.has(id)) continue;
+    if (visited.has(id)) continue;
+    visited.add(id);
+    parent.set(id, null);
+    queue.push(id);
+  }
+
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+    order.push(current);
+    for (const edge of succ.get(current) ?? []) {
+      if (allowed && !allowed.has(edge.to)) continue;
+      if (visited.has(edge.to)) continue;
+      visited.add(edge.to);
+      parent.set(edge.to, current);
+      queue.push(edge.to);
+    }
+  }
+
+  return { visited, parent, order };
+}
+
+function pathTo(parent: Map<string, string | null>, target: string): string[] {
+  const path: string[] = [];
+  let cursor: string | null | undefined = target;
+  while (cursor !== null && cursor !== undefined) {
+    path.unshift(cursor);
+    cursor = parent.get(cursor) ?? null;
+  }
+  return path;
+}
+
+/** Reverse-reachability: every state from which some state in `targets` is reachable. */
+function canReach(
+  targets: Set<string>,
+  succ: Map<string, Edge[]>,
+  within: Set<string>
+): Set<string> {
+  const pred = new Map<string, string[]>();
+  within.forEach(id => pred.set(id, []));
+  within.forEach(id => {
+    for (const edge of succ.get(id) ?? []) {
+      if (within.has(edge.to)) pred.get(edge.to)!.push(id);
+    }
+  });
+
+  const result = new Set<string>();
+  const queue: string[] = [];
+  targets.forEach(id => {
+    if (within.has(id)) {
+      result.add(id);
+      queue.push(id);
+    }
+  });
+
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+    for (const p of pred.get(current) ?? []) {
+      if (!result.has(p)) {
+        result.add(p);
+        queue.push(p);
+      }
+    }
+  }
+  return result;
 }
 
 /**
- * Runs the model checker on the state machine.
- * Generates step-by-step trace logs for visual playback,
- * detects safety violations (unreachable bad states),
- * and liveness violations (non-trivial cycles excluding success targets).
+ * Search inside `allowed` for an infinite bad behaviour: either a cycle (a
+ * "lasso") or a dead-end state with no outgoing transitions at all.
+ * Returns the suffix path from `start` plus where the loop closes.
  */
+function findLassoOrDeadlock(
+  start: string,
+  allowed: Set<string>,
+  succ: Map<string, Edge[]>
+): { suffix: string[]; loopStart: number | null } | null {
+  const stack: string[] = [];
+  const onStack = new Set<string>();
+  const finished = new Set<string>();
+  let found: { suffix: string[]; loopStart: number | null } | null = null;
+
+  const dfs = (id: string): boolean => {
+    stack.push(id);
+    onStack.add(id);
+
+    const edges = (succ.get(id) ?? []);
+
+    // A state with no outgoing transitions at all is a deadlock.
+    if (edges.length === 0) {
+      found = { suffix: [...stack], loopStart: null };
+      return true;
+    }
+
+    for (const edge of edges) {
+      if (!allowed.has(edge.to)) continue;
+      if (onStack.has(edge.to)) {
+        found = { suffix: [...stack, edge.to], loopStart: stack.indexOf(edge.to) };
+        return true;
+      }
+      if (!finished.has(edge.to) && dfs(edge.to)) return true;
+    }
+
+    onStack.delete(id);
+    finished.add(id);
+    stack.pop();
+    return false;
+  };
+
+  if (!allowed.has(start)) return null;
+  dfs(start);
+  return found;
+}
+
+/* ------------------------------------------------------------------ */
+/* The model checker                                                   */
+/* ------------------------------------------------------------------ */
+
+export interface VerifyOptions {
+  /**
+   * When true, we assume *weak fairness*: if a transition out of a loop is
+   * available over and over again, the system eventually takes it. Real
+   * hardware behaves this way; without the assumption almost every cyclic
+   * system "fails" liveness, which is not a useful answer.
+   */
+  assumeFairness: boolean;
+}
+
 export function verifyModel(
   states: KripkeState[],
   transitions: KripkeTransition[],
-  property: TemporalProperty
+  property: TemporalProperty,
+  options: VerifyOptions = { assumeFairness: true }
 ): VerificationResult {
   const steps: ModelCheckerStep[] = [];
-  const initial = states.find(s => s.isInitial);
+  const stateMap = new Map(states.map(s => [s.id, s]));
+  const succ = buildSuccessors(states, transitions);
+  const label = (id: string) => stateMap.get(id)?.label ?? id;
 
+  const initial = states.find(s => s.isInitial);
   if (!initial) {
     return {
       success: false,
-      steps,
-      message: "No initial state designated! Place/select an initial starting node."
+      outcome: 'no_initial',
+      steps: [{
+        type: 'violation',
+        currentNodeId: '',
+        visitedNodes: [],
+        path: [],
+        message: 'No initial state is marked. A model checker has to start somewhere — pick a state and set it as initial.'
+      }],
+      reachable: [],
+      unreachable: states.map(s => s.id),
+      message: 'No initial state is marked. Select a state and press SET under "Initial state".'
     };
   }
 
-  // Helper map for fast lookup
-  const stateMap = new Map(states.map(s => [s.id, s]));
-  
-  // Safety checking DFS/BFS
-  if (property.type === 'safety') {
-    const visited = new Set<string>();
-    const queue: { current: string; path: string[] }[] = [];
-    
-    queue.push({ current: initial.id, path: [initial.id] });
+  /* ---- Step 1: reachability. Only reachable states can ever occur. ---- */
+
+  const reach = bfs([initial.id], succ);
+  const reachable = reach.visited;
+  const unreachable = states.filter(s => !reachable.has(s.id)).map(s => s.id);
+
+  steps.push({
+    type: 'info',
+    currentNodeId: initial.id,
+    visitedNodes: [initial.id],
+    path: [initial.id],
+    message: `Starting from the initial state "${initial.label}". Exploring every state the system can actually get to.`
+  });
+
+  for (const id of reach.order) {
     steps.push({
       type: 'visit',
-      currentNodeId: initial.id,
-      visitedNodes: [],
-      path: [initial.id],
-      message: `Starting verification from initial state: ${initial.label}`
+      currentNodeId: id,
+      visitedNodes: [...reachable],
+      path: pathTo(reach.parent, id),
+      message: `Reached "${label(id)}" in ${pathTo(reach.parent, id).length - 1} step(s).`
     });
+  }
 
-    while (queue.length > 0) {
-      const { current, path } = queue.shift()!;
-      
-      if (visited.has(current)) {
-        continue;
-      }
-      visited.add(current);
+  if (unreachable.length > 0) {
+    steps.push({
+      type: 'warning',
+      currentNodeId: initial.id,
+      visitedNodes: [...reachable],
+      path: [],
+      message: `${unreachable.length} state(s) are unreachable and will be ignored: ${unreachable.map(label).join(', ')}. Unreachable states cannot break the system — but they usually mean a wire is missing.`
+    });
+  }
 
-      const state = stateMap.get(current);
-      if (!state) continue;
+  const unreachableHint = unreachable.length > 0
+    ? `Heads up: ${unreachable.map(label).join(', ')} can never be reached from the initial state, so the checker ignored them.`
+    : undefined;
 
+  /* ---- Step 2: check the specification. ---- */
+
+  const spec = property.spec;
+
+  /* -------- Safety: G ¬bad -------- */
+  if (spec.kind === 'invariant') {
+    for (const id of reach.order) {
+      const state = stateMap.get(id)!;
+      const path = pathTo(reach.parent, id);
       steps.push({
         type: 'check_state',
-        currentNodeId: current,
-        visitedNodes: Array.from(visited),
-        path: [...path],
-        message: `Checking state properties for "${state.label}"`
+        currentNodeId: id,
+        visitedNodes: [...reachable],
+        path,
+        message: `Checking "${state.label}" against ${property.formula}`
       });
 
-      // Check violation
-      if (property.isViolated(state, states)) {
+      if (spec.bad(state)) {
         steps.push({
           type: 'violation',
-          currentNodeId: current,
-          visitedNodes: Array.from(visited),
-          path: [...path],
-          message: `🚨 Safety Violation found! ${property.name} failed: "${state.label}" violates constraint.`
+          currentNodeId: id,
+          visitedNodes: [...reachable],
+          path,
+          message: `Safety violated at "${state.label}". Shortest counterexample: ${path.map(label).join(' → ')}`
         });
-
         return {
           success: false,
+          outcome: 'safety_violation',
           steps,
           trace: path,
-          errorStateId: current,
-          message: `Safety violation found: ${property.explanation}`
-        };
-      }
-
-      // Find next transitions
-      const nextTransitions = transitions.filter(t => t.from === current);
-      for (const t of nextTransitions) {
-        if (!visited.has(t.to)) {
-          queue.push({ current: t.to, path: [...path, t.to] });
-          steps.push({
-            type: 'visit',
-            currentNodeId: t.to,
-            visitedNodes: Array.from(visited),
-            path: [...path, t.to],
-            message: `Queueing transition: "${t.action}" to "${stateMap.get(t.to)?.label || t.to}"`
-          });
-        }
-      }
-    }
-
-    steps.push({
-      type: 'success',
-      currentNodeId: initial.id,
-      visitedNodes: Array.from(visited),
-      path: [],
-      message: "🎉 Success! Checked all reachable states. No safety violations found."
-    });
-
-    return {
-      success: true,
-      steps,
-      message: "Perfect! All states satisfy the safety constraints."
-    };
-  } 
-  
-  // Liveness checking (Level 2 & 3: Microwave/Rover)
-  // Formula G (p -> F q) e.g., G (Heating -> F CookComplete).
-  // A liveness violation occurs if there is a cycle where p is true or has been activated,
-  // but q is never reached and we lock in a cycle.
-  // We can model this by:
-  // 1. Finding the trigger states where p is active (e.g. state.innerOpen is true, meaning heating or request is active).
-  // 2. Finding the success state where q is reached (e.g. CookComplete, which is state.pressurized === true, or Done state).
-  // 3. Finding if there is a path from the trigger states to a cycle that never contains the success state.
-  if (property.id === 'microwave_liveness') {
-    // p: Heating (state.innerOpen), q: Done (state.pressurized)
-    const isTrigger = (s: KripkeState) => s.innerOpen; // Heating
-    const isSuccess = (s: KripkeState) => s.pressurized; // CookComplete
-
-    // Let's do a path check: run DFS to find any infinite cycles of states reachable from a trigger
-    // that don't ever reach or include a success state.
-    const path: string[] = [];
-    const visited = new Set<string>();
-    const recStack = new Set<string>();
-    let violationTrace: string[] = [];
-    let loopStartIdx = -1;
-
-    // We do DFS checking for cycles in the subgraph of states that are NOT success states
-    // reachable from any active trigger.
-    function findLivenessBug(uId: string): boolean {
-      visited.add(uId);
-      recStack.add(uId);
-      path.push(uId);
-
-      const state = stateMap.get(uId);
-      if (!state) return false;
-
-      // Add a step for visualization
-      steps.push({
-        type: 'check_state',
-        currentNodeId: uId,
-        visitedNodes: Array.from(visited),
-        path: [...path],
-        message: `Analyzing path branch at "${state.label}"...`
-      });
-
-      const nextTransitions = transitions.filter(t => t.from === uId);
-      for (const t of nextTransitions) {
-        const vId = t.to;
-        const vState = stateMap.get(vId);
-        
-        // If it's a success state, this path is "rescued" (successfully cooking finishes!)
-        if (vState && isSuccess(vState)) {
-          continue; 
-        }
-
-        if (!visited.has(vId)) {
-          if (findLivenessBug(vId)) {
-            return true;
-          }
-        } else if (recStack.has(vId)) {
-          // Found a cycle! Since neither this state nor any state in the DFS recursion stack 
-          // (which can reach this cycle) contains a success state, we have a dead loop/livelock!
-          loopStartIdx = path.indexOf(vId);
-          violationTrace = [...path, vId];
-          return true;
-        }
-      }
-
-      recStack.delete(uId);
-      path.pop();
-      return false;
-    }
-
-    // Start checking from the 'heating' or trigger state if reachable
-    const triggerStates = states.filter(isTrigger);
-    for (const tState of triggerStates) {
-      visited.clear();
-      recStack.clear();
-      path.length = 0;
-      
-      steps.push({
-        type: 'visit',
-        currentNodeId: tState.id,
-        visitedNodes: [],
-        path: [tState.id],
-        message: `Trigger detected: "${tState.label}". Checking for eventual progress...`
-      });
-
-      if (findLivenessBug(tState.id)) {
-        steps.push({
-          type: 'violation',
-          currentNodeId: violationTrace[violationTrace.length - 1],
-          visitedNodes: Array.from(visited),
-          path: violationTrace,
-          message: `🚨 Livelock Cycle Detected! The machine can loop infinitely without ever finishing cooking.`
-        });
-
-        return {
-          success: false,
-          steps,
-          trace: violationTrace,
-          lassoIndex: loopStartIdx,
-          message: "Liveness Violation: The microwave has a cycle where the heating element stays active or stuck without ever shutting down or reaching complete cook!"
-        };
-      }
-    }
-
-    // If no violations found but we need to verify if the oven is stuck in static dead-end
-    // e.g. state 'open_door' cannot reach cook complete
-    const openState = states.find(s => s.id === 'open_door');
-    if (openState) {
-      // Find if there is any path from open_door back to done or ready
-      const visitedFromOpen = new Set<string>();
-      const queue = [openState.id];
-      while (queue.length > 0) {
-        const curr = queue.shift()!;
-        if (visitedFromOpen.has(curr)) continue;
-        visitedFromOpen.add(curr);
-        transitions.filter(t => t.from === curr).forEach(t => queue.push(t.to));
-      }
-      
-      const completes = Array.from(visitedFromOpen).some(id => id === 'done' || id === 'ready');
-      if (!completes) {
-        steps.push({
-          type: 'violation',
-          currentNodeId: 'open_door',
-          visitedNodes: Array.from(visitedFromOpen),
-          path: ['heating', 'open_door'],
-          message: `🚨 Dead-end state! Once you "Open Door", you can never reach completion.`
-        });
-        return {
-          success: false,
-          steps,
-          trace: ['heating', 'open_door'],
-          message: "Liveness Violation: Open door is a dead-end state and cannot reach the happy path state."
+          errorStateId: id,
+          reachable: [...reachable],
+          unreachable,
+          message: `Safety violation. ${property.explanation}`,
+          hint: 'Because we searched breadth-first, this is the shortest way to reach the bad state. Follow the red trail and remove the step that should not be possible.'
         };
       }
     }
@@ -259,139 +298,182 @@ export function verifyModel(
     steps.push({
       type: 'success',
       currentNodeId: initial.id,
-      visitedNodes: states.map(s => s.id),
+      visitedNodes: [...reachable],
       path: [],
-      message: "🎉 Success! Verified liveness. Under all behaviors, heating eventually finishes."
+      message: `Checked all ${reachable.size} reachable state(s). ${property.formula} holds on every one of them.`
     });
 
     return {
       success: true,
+      outcome: 'ok',
       steps,
-      message: "Excellent! The liveness check passed completely. Cooking always finishes."
+      reachable: [...reachable],
+      unreachable,
+      message: `Verified. Every one of the ${reachable.size} reachable states satisfies ${property.formula}.`,
+      hint: unreachableHint
     };
   }
 
-  // Level 3: Mars Rover Hatch liveness / deadlock safety
-  // AG (Request -> AF HatchOpen)
-  // If there's a deadlock state (like 'dust_wait' with self loop 'rt_self_loop'), it is a deadlock.
-  if (property.id === 'rover_safety') {
-    const isTrigger = (s: KripkeState) => s.id === 'request';
-    const isSuccess = (s: KripkeState) => s.innerOpen; // HatchOpen is innerOpen
-
-    const visited = new Set<string>();
-    const recStack = new Set<string>();
-    const path: string[] = [];
-    let violationTrace: string[] = [];
-    let loopStartIdx = -1;
-
-    function checkRoverDeadlock(uId: string): boolean {
-      visited.add(uId);
-      recStack.add(uId);
-      path.push(uId);
-
-      const state = stateMap.get(uId);
-      if (!state) return false;
-
-      steps.push({
-        type: 'check_state',
-        currentNodeId: uId,
-        visitedNodes: Array.from(visited),
-        path: [...path],
-        message: `Tracing path at "${state.label}"...`
-      });
-
-      const nextTransitions = transitions.filter(t => t.from === uId);
-      
-      // If there are no outgoing transitions, that is a terminal deadlock state!
-      if (nextTransitions.length === 0 && !isSuccess(state)) {
-        violationTrace = [...path];
-        return true;
-      }
-
-      for (const t of nextTransitions) {
-        const vId = t.to;
-        const vState = stateMap.get(vId);
-
-        if (vState && isSuccess(vState)) {
-          continue; // Meets progress condition
-        }
-
-        if (!visited.has(vId)) {
-          if (checkRoverDeadlock(vId)) return true;
-        } else if (recStack.has(vId)) {
-          // Found an infinite self loop or cycle excluding success hatch_open
-          loopStartIdx = path.indexOf(vId);
-          violationTrace = [...path, vId];
-          return true;
-        }
-      }
-
-      recStack.delete(uId);
-      path.pop();
-      return false;
-    }
-
-    // Run DFS from 'request' state
-    const requestNode = states.find(isTrigger);
-    if (requestNode) {
-      if (checkRoverDeadlock(requestNode.id)) {
+  /* -------- No dead ends: G ¬deadlock -------- */
+  if (spec.kind === 'no_deadlock') {
+    for (const id of reach.order) {
+      if ((succ.get(id) ?? []).length === 0) {
+        const path = pathTo(reach.parent, id);
         steps.push({
           type: 'violation',
-          currentNodeId: violationTrace[violationTrace.length - 1],
-          visitedNodes: Array.from(visited),
-          path: violationTrace,
-          message: `🚨 Deadlock pattern detected at "${stateMap.get(violationTrace[violationTrace.length-1])?.label}"!`
+          currentNodeId: id,
+          visitedNodes: [...reachable],
+          path,
+          message: `Dead end at "${label(id)}" — it has no outgoing transitions, so the system freezes here forever.`
         });
-
         return {
           success: false,
+          outcome: 'deadlock',
           steps,
-          trace: violationTrace,
-          lassoIndex: loopStartIdx >= 0 ? loopStartIdx : undefined,
-          message: "Liveness Violation: The rover gets stuck in a retry deadlock or infinite wait, never activating the hatch."
+          trace: path,
+          errorStateId: id,
+          reachable: [...reachable],
+          unreachable,
+          message: `Deadlock: "${label(id)}" has no way out.`,
+          hint: 'Give this state at least one outgoing transition, or remove it.'
         };
       }
     }
-
     steps.push({
       type: 'success',
       currentNodeId: initial.id,
-      visitedNodes: states.map(s => s.id),
+      visitedNodes: [...reachable],
       path: [],
-      message: "🎉 Success! The rover safety and progress properties are fully satisfied."
+      message: 'No dead ends: every reachable state has somewhere to go.'
     });
-
     return {
       success: true,
+      outcome: 'ok',
       steps,
-      message: "Spectacular! Safety & progress is fully satisfied."
+      reachable: [...reachable],
+      unreachable,
+      message: 'Verified. The system can never freeze — every reachable state has an outgoing transition.',
+      hint: unreachableHint
     };
   }
 
-  // Generics for Sandbox chapter
-  // Simply runs a general safety BFS search checking the logic of 'sandbox_custom'
-  const visited = new Set<string>();
-  const queue = [initial.id];
-  while (queue.length > 0) {
-    const curr = queue.shift()!;
-    if (visited.has(curr)) continue;
-    visited.add(curr);
-    
-    const state = stateMap.get(curr);
-    if (state && property.isViolated(state, states)) {
+  /* -------- Liveness: G (p ⇒ F q) -------- */
+
+  const { p, q } = spec;
+  const triggers = reach.order.filter(id => p(stateMap.get(id)!));
+  const goals = new Set(reach.order.filter(id => q(stateMap.get(id)!)));
+
+  steps.push({
+    type: 'info',
+    currentNodeId: initial.id,
+    visitedNodes: [...reachable],
+    path: [],
+    message: `Trigger states (where the promise starts): ${triggers.length ? triggers.map(label).join(', ') : 'none'}. Goal states (where it is kept): ${goals.size ? [...goals].map(label).join(', ') : 'none'}.`
+  });
+
+  /* Vacuity — the property "passes" only because it never applies. */
+  if (triggers.length === 0) {
+    steps.push({
+      type: 'warning',
+      currentNodeId: initial.id,
+      visitedNodes: [...reachable],
+      path: [],
+      message: `${property.formula} is satisfied VACUOUSLY: no reachable state ever makes the left-hand side true, so the promise is never tested.`
+    });
+    return {
+      success: false,
+      outcome: 'vacuous',
+      steps,
+      reachable: [...reachable],
+      unreachable,
+      message: `Vacuously true. Nothing in this model ever triggers the property, so "always keep the promise" is trivially satisfied — the checker learned nothing.`,
+      hint: 'Real verification teams treat a vacuous pass as a failure. Restore the behaviour that makes the trigger reachable and check again.'
+    };
+  }
+
+  /* States that still have a route to a goal state. */
+  const canStillReachGoal = canReach(goals, succ, reachable);
+  /* States from which the goal is gone forever. */
+  const hopeless = new Set([...reachable].filter(id => !canStillReachGoal.has(id)));
+  /* Search space: reachable states that have not already kept the promise. */
+  const pending = new Set([...reachable].filter(id => !goals.has(id)));
+
+  const searchSpace = options.assumeFairness ? hopeless : pending;
+
+  for (const triggerId of triggers) {
+    if (goals.has(triggerId)) continue; // promise kept the instant it was made
+
+    // Where can we get from the trigger without ever passing through a goal?
+    const fromTrigger = bfs([triggerId], succ, pending);
+
+    for (const candidate of fromTrigger.order) {
+      if (!searchSpace.has(candidate)) continue;
+
+      const bad = findLassoOrDeadlock(candidate, searchSpace, succ);
+      if (!bad) continue;
+
+      const prefix = pathTo(reach.parent, triggerId);
+      const middle = pathTo(fromTrigger.parent, candidate).slice(1);
+      const suffix = bad.suffix.slice(1);
+      const trace = [...prefix, ...middle, ...suffix];
+      // `bad.suffix[0]` is `candidate`, which is already the last element of
+      // prefix+middle, so the suffix is offset by one.
+      const lassoIndex =
+        bad.loopStart === null
+          ? undefined
+          : prefix.length + middle.length - 1 + bad.loopStart;
+
+      const isDeadlock = bad.loopStart === null;
+      const endId = trace[trace.length - 1];
+
+      steps.push({
+        type: 'violation',
+        currentNodeId: endId,
+        visitedNodes: [...reachable],
+        path: trace,
+        message: isDeadlock
+          ? `Dead end at "${label(endId)}". Once "${label(triggerId)}" happens the system can walk into a state with no exit, so ${property.formula} is broken.`
+          : `Loop found: ${trace.slice(lassoIndex ?? 0).map(label).join(' → ')}. The system can go round this loop forever without ever reaching the goal.`
+      });
+
+      const fairnessNote = options.assumeFairness
+        ? 'Fairness is assumed, so this is a real bug: from here there is no route back to the goal at all.'
+        : 'Fairness is switched OFF, so a loop counts as a bug even if it has an exit. Turn fairness on to assume the system eventually takes an available exit.';
+
       return {
         success: false,
+        outcome: isDeadlock ? 'deadlock' : 'livelock',
         steps,
-        trace: [initial.id, curr],
-        message: `Violation occurred at state: "${state.label}"`
+        trace,
+        lassoIndex,
+        errorStateId: endId,
+        reachable: [...reachable],
+        unreachable,
+        message: isDeadlock
+          ? `Deadlock. After "${label(triggerId)}", the system can end up in "${label(endId)}", which has no outgoing transitions. ${property.explanation}`
+          : `Livelock. After "${label(triggerId)}", the system can loop forever without reaching the goal. ${property.explanation}`,
+        hint: fairnessNote
       };
     }
-    transitions.filter(t => t.from === curr).forEach(t => queue.push(t.to));
   }
+
+  steps.push({
+    type: 'success',
+    currentNodeId: initial.id,
+    visitedNodes: [...reachable],
+    path: [],
+    message: `${property.formula} holds. Every trigger is followed by the goal on every ${options.assumeFairness ? 'fair ' : ''}run.`
+  });
 
   return {
     success: true,
+    outcome: 'ok',
     steps,
-    message: "Verified successfully!"
+    reachable: [...reachable],
+    unreachable,
+    message: options.assumeFairness
+      ? `Verified under fairness. Whenever the trigger happens, the system always gets to the goal — assuming it does not refuse an available exit forever.`
+      : `Verified without any fairness assumption. Even an adversarial scheduler cannot stop the system from reaching the goal.`,
+    hint: unreachableHint
   };
 }
